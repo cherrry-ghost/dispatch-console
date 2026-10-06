@@ -122,3 +122,47 @@ def create_location(location: LocationIn):
             ),
         ).fetchone()
     return {"id": row["id"], **location.model_dump()}
+
+class ShipmentIn(BaseModel):
+    description: str
+    weight_kg: int = Field(gt=0)
+    is_hazardous: bool = False
+    origin_id: int
+    destination_id: int
+
+
+@app.get("/shipments")
+def list_shipments():
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, description, weight_kg, is_hazardous, origin_id, "
+            "destination_id, status, created_at FROM shipments ORDER BY id"
+        ).fetchall()
+    return rows
+
+
+@app.post("/shipments")
+def create_shipment(shipment: ShipmentIn):
+    if shipment.origin_id == shipment.destination_id:
+        raise HTTPException(
+            status_code=400, detail="Origin and destination must be different"
+        )
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO shipments "
+                "(description, weight_kg, is_hazardous, origin_id, destination_id) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id, status, created_at",
+                (
+                    shipment.description,
+                    shipment.weight_kg,
+                    shipment.is_hazardous,
+                    shipment.origin_id,
+                    shipment.destination_id,
+                ),
+            ).fetchone()
+    except psycopg.errors.ForeignKeyViolation:
+        raise HTTPException(
+            status_code=400, detail="Origin or destination location does not exist"
+        )
+    return {**row, **shipment.model_dump()}
