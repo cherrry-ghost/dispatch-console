@@ -1,5 +1,8 @@
-import sqlite3
+import os
+
+import psycopg
 from fastapi import FastAPI, HTTPException
+from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -12,9 +15,7 @@ class VehicleIn(BaseModel):
 
 
 def get_connection():
-    conn = sqlite3.connect("dispatch.db")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
 
 
 @app.get("/")
@@ -29,26 +30,24 @@ def health():
 
 @app.get("/vehicles")
 def list_vehicles():
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT id, plate, vehicle_type, capacity_kg FROM vehicles"
-    ).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, plate, vehicle_type, capacity_kg FROM vehicles ORDER BY id"
+        ).fetchall()
+    return rows
 
 
 @app.post("/vehicles")
 def create_vehicle(vehicle: VehicleIn):
-    conn = get_connection()
     try:
-        cur = conn.execute(
-            "INSERT INTO vehicles (plate, vehicle_type, capacity_kg) VALUES (?, ?, ?)",
-            (vehicle.plate, vehicle.vehicle_type, vehicle.capacity_kg),
+        with get_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO vehicles (plate, vehicle_type, capacity_kg) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (vehicle.plate, vehicle.vehicle_type, vehicle.capacity_kg),
+            ).fetchone()
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(
+            status_code=409, detail="A vehicle with this plate already exists"
         )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(status_code=409, detail="A vehicle with this plate already exists")
-    new_id = cur.lastrowid
-    conn.close()
-    return {"id": new_id, **vehicle.model_dump()}
+    return {"id": row["id"], **vehicle.model_dump()}
