@@ -166,3 +166,55 @@ def create_shipment(shipment: ShipmentIn):
             status_code=400, detail="Origin or destination location does not exist"
         )
     return {**row, **shipment.model_dump()}
+
+class AssignmentIn(BaseModel):
+    shipment_id: int
+    vehicle_id: int
+    driver_id: int
+    reason: str = Field(min_length=1)
+
+
+@app.get("/assignments")
+def list_assignments():
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, shipment_id, vehicle_id, driver_id, started_at, "
+            "ended_at, reason FROM assignments ORDER BY id"
+        ).fetchall()
+    return rows
+
+
+@app.post("/assignments")
+def create_assignment(assignment: AssignmentIn):
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE assignments SET ended_at = now() "
+                "WHERE shipment_id = %s AND ended_at IS NULL",
+                (assignment.shipment_id,),
+            )
+            row = conn.execute(
+                "INSERT INTO assignments (shipment_id, vehicle_id, driver_id, reason) "
+                "VALUES (%s, %s, %s, %s) RETURNING id, started_at",
+                (
+                    assignment.shipment_id,
+                    assignment.vehicle_id,
+                    assignment.driver_id,
+                    assignment.reason,
+                ),
+            ).fetchone()
+            conn.execute(
+                "UPDATE shipments SET status = 'assigned' WHERE id = %s",
+                (assignment.shipment_id,),
+            )
+    except psycopg.errors.ForeignKeyViolation:
+        raise HTTPException(
+            status_code=400,
+            detail="Shipment, vehicle or driver does not exist",
+        )
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(
+            status_code=409,
+            detail="This shipment already has an active assignment",
+        )
+    return {**row, **assignment.model_dump()}
