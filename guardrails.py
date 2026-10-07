@@ -59,10 +59,20 @@ def check_hazmat(vehicle, driver, shipment, today):
         return RuleResult("hazmat", "block", "Hazardous shipment but the driver is not hazmat certified.")
     return None
 
+def check_near_capacity(vehicle, driver, shipment, today):
+    weight = shipment["weight_kg"]
+    capacity = vehicle["capacity_kg"]
+    if weight <= capacity and weight >= 0.9 * capacity:
+        return RuleResult(
+            "near_capacity", "warn",
+            f"Shipment weighs {weight} kg, which is 90% or more of the vehicle's {capacity} kg capacity.",
+        )
+    return None
+
 
 RULES = [
     check_capacity, check_licence, check_insurance,
-    check_fitness, check_vehicle_type, check_hazmat,
+    check_fitness, check_vehicle_type, check_hazmat, check_near_capacity,
 ]
 
 

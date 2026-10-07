@@ -85,3 +85,12 @@ def test_all_problems_are_reported_together():
     results = run(shipment=make_shipment(weight_kg=9000),
                   driver=make_driver(licence_expiry=date(2026, 1, 1)))
     assert fired(results) == {"capacity", "licence"}
+
+def test_near_capacity_warns_but_allows():
+    results = run(shipment=make_shipment(weight_kg=4600))
+    assert fired(results) == {"near_capacity"}
+    assert is_allowed(results)
+
+
+def test_comfortable_load_has_no_warning():
+    assert run(shipment=make_shipment(weight_kg=4000)) == []
