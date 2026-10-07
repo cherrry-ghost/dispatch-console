@@ -1,7 +1,13 @@
 def make_vehicle(client):
     response = client.post(
         "/vehicles",
-        json={"plate": "TN01AB1234", "vehicle_type": "truck", "capacity_kg": 5000},
+                json={
+            "plate": "TN01AB1234",
+            "vehicle_type": "truck",
+            "capacity_kg": 5000,
+            "insurance_expiry": "2035-12-31",
+            "fitness_expiry": "2035-12-31",
+        },
     )
     return response.json()["id"]
 
@@ -12,13 +18,13 @@ def make_driver(client, licence):
         json={
             "full_name": "Test Driver",
             "licence_number": licence,
-            "licence_expiry": "2028-06-30",
+            "licence_expiry": "2035-06-30",
         },
     )
     return response.json()["id"]
 
 
-def make_shipment(client):
+def make_shipment(client, weight=2000):
     origin = client.post(
         "/locations",
         json={
@@ -41,7 +47,7 @@ def make_shipment(client):
         "/shipments",
         json={
             "description": "Rice bags",
-            "weight_kg": 2000,
+            "weight_kg": weight,
             "origin_id": origin,
             "destination_id": destination,
         },
@@ -90,3 +96,30 @@ def test_failed_assignment_keeps_current_one(client):
     rows = client.get("/assignments").json()
     assert len(rows) == 1
     assert rows[0]["ended_at"] is None
+
+def test_overweight_assignment_is_blocked(client):
+    vehicle = make_vehicle(client)
+    ravi = make_driver(client, "TN0120250001")
+    shipment = make_shipment(client, weight=9000)
+
+    response = assign(client, shipment, vehicle, ravi, "too heavy")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["violations"][0]["rule"] == "capacity"
+    assert client.get("/assignments").json() == []
+    assert client.get("/shipments").json()[0]["status"] == "pending"
+
+
+def test_vehicle_without_dates_is_blocked(client):
+    vehicle = client.post(
+        "/vehicles",
+        json={"plate": "TN02CD5678", "vehicle_type": "truck", "capacity_kg": 5000},
+    ).json()["id"]
+    ravi = make_driver(client, "TN0120250001")
+    shipment = make_shipment(client)
+
+    response = assign(client, shipment, vehicle, ravi, "no paperwork")
+
+    assert response.status_code == 422
+    rules = {v["rule"] for v in response.json()["detail"]["violations"]}
+    assert rules == {"insurance", "fitness"}

@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from datetime import date
 import os
 
@@ -5,6 +6,7 @@ import psycopg
 from fastapi import FastAPI, HTTPException
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
+from guardrails import evaluate, is_allowed
 
 app = FastAPI()
 
@@ -13,6 +15,8 @@ class VehicleIn(BaseModel):
     plate: str
     vehicle_type: str
     capacity_kg: int
+    insurance_expiry: date | None = None
+    fitness_expiry: date | None = None
 
 
 def get_connection():
@@ -33,7 +37,8 @@ def health():
 def list_vehicles():
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, plate, vehicle_type, capacity_kg FROM vehicles ORDER BY id"
+                        "SELECT id, plate, vehicle_type, capacity_kg, insurance_expiry, "
+            "fitness_expiry FROM vehicles ORDER BY id"
         ).fetchall()
     return rows
 
@@ -42,10 +47,17 @@ def list_vehicles():
 def create_vehicle(vehicle: VehicleIn):
     try:
         with get_connection() as conn:
-            row = conn.execute(
-                "INSERT INTO vehicles (plate, vehicle_type, capacity_kg) "
-                "VALUES (%s, %s, %s) RETURNING id",
-                (vehicle.plate, vehicle.vehicle_type, vehicle.capacity_kg),
+                        row = conn.execute(
+                "INSERT INTO vehicles "
+                "(plate, vehicle_type, capacity_kg, insurance_expiry, fitness_expiry) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (
+                    vehicle.plate,
+                    vehicle.vehicle_type,
+                    vehicle.capacity_kg,
+                    vehicle.insurance_expiry,
+                    vehicle.fitness_expiry,
+                ),
             ).fetchone()
     except psycopg.errors.UniqueViolation:
         raise HTTPException(
@@ -129,14 +141,16 @@ class ShipmentIn(BaseModel):
     is_hazardous: bool = False
     origin_id: int
     destination_id: int
+    required_vehicle_type: str | None = None
 
 
 @app.get("/shipments")
 def list_shipments():
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, description, weight_kg, is_hazardous, origin_id, "
-            "destination_id, status, created_at FROM shipments ORDER BY id"
+                        "SELECT id, description, weight_kg, is_hazardous, origin_id, "
+            "destination_id, required_vehicle_type, status, created_at "
+            "FROM shipments ORDER BY id"
         ).fetchall()
     return rows
 
@@ -150,15 +164,17 @@ def create_shipment(shipment: ShipmentIn):
     try:
         with get_connection() as conn:
             row = conn.execute(
-                "INSERT INTO shipments "
-                "(description, weight_kg, is_hazardous, origin_id, destination_id) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id, status, created_at",
+                                "INSERT INTO shipments "
+                "(description, weight_kg, is_hazardous, origin_id, destination_id, "
+                "required_vehicle_type) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, status, created_at",
                 (
                     shipment.description,
                     shipment.weight_kg,
                     shipment.is_hazardous,
                     shipment.origin_id,
                     shipment.destination_id,
+                    shipment.required_vehicle_type,
                 ),
             ).fetchone()
     except psycopg.errors.ForeignKeyViolation:
@@ -186,6 +202,29 @@ def list_assignments():
 
 @app.post("/assignments")
 def create_assignment(assignment: AssignmentIn):
+    with get_connection() as conn:
+        vehicle = conn.execute(
+            "SELECT * FROM vehicles WHERE id = %s", (assignment.vehicle_id,)
+        ).fetchone()
+        driver = conn.execute(
+            "SELECT * FROM drivers WHERE id = %s", (assignment.driver_id,)
+        ).fetchone()
+        shipment = conn.execute(
+            "SELECT * FROM shipments WHERE id = %s", (assignment.shipment_id,)
+        ).fetchone()
+    if vehicle is None or driver is None or shipment is None:
+        raise HTTPException(
+            status_code=400, detail="Shipment, vehicle or driver does not exist"
+        )
+    results = evaluate(vehicle, driver, shipment, date.today())
+    if not is_allowed(results):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Assignment blocked by guardrails",
+                "violations": [asdict(r) for r in results],
+            },
+        )
     try:
         with get_connection() as conn:
             conn.execute(
@@ -217,4 +256,4 @@ def create_assignment(assignment: AssignmentIn):
             status_code=409,
             detail="This shipment already has an active assignment",
         )
-    return {**row, **assignment.model_dump()}
+    return {**row, **assignment.model_dump(), "warnings": [asdict(r) for r in results]}
