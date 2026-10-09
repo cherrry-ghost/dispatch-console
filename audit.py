@@ -1,6 +1,7 @@
 import hashlib
 import json
 from datetime import datetime, timezone
+from psycopg.rows import tuple_row
 
 from psycopg.types.json import Jsonb
 
@@ -30,7 +31,7 @@ def append_audit(conn, actor_type, action, outcome, actor_id=None,
     # Only one writer at a time, otherwise two rows could claim the same
     # prev_hash and fork the chain. The lock lasts until the transaction ends.
     conn.execute("LOCK TABLE audit_log IN EXCLUSIVE MODE")
-    last = conn.execute(
+    last =     last = conn.cursor(row_factory=tuple_row).execute(
         "SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1"
     ).fetchone()
     prev_hash = last[0] if last else GENESIS_HASH
@@ -48,7 +49,7 @@ def append_audit(conn, actor_type, action, outcome, actor_id=None,
 
 
 def verify_chain(conn):
-    rows = conn.execute(
+    rows =     rows = conn.cursor(row_factory=tuple_row).execute(
         "SELECT id, created_at, actor_type, actor_id, action, entity_type, "
         "entity_id, outcome, details, prev_hash, hash "
         "FROM audit_log ORDER BY id"

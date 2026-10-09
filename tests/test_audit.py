@@ -2,6 +2,7 @@ import os
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from audit import append_audit, verify_chain
 
@@ -41,3 +42,20 @@ def test_tampering_is_detected():
         result = verify_chain(conn)
         assert result["ok"] is False
         assert result["broken_at_id"] == 2
+
+def test_deleted_row_is_detected():
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        make_rows(conn)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        conn.execute("ALTER TABLE audit_log DISABLE TRIGGER audit_log_append_only")
+        conn.execute("DELETE FROM audit_log WHERE id = 2")
+        conn.execute("ALTER TABLE audit_log ENABLE TRIGGER audit_log_append_only")
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        result = verify_chain(conn)
+        assert result == {"ok": False, "broken_at_id": 3, "reason": "prev_hash mismatch"}
+
+
+def test_works_with_dict_row_connections():
+    with psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row) as conn:
+        make_rows(conn, 2)
+        assert verify_chain(conn) == {"ok": True, "checked": 2}
