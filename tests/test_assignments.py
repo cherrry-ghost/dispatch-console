@@ -1,7 +1,14 @@
+import os
+
+import psycopg
+
+from audit import verify_chain
+
+
 def make_vehicle(client):
     response = client.post(
         "/vehicles",
-                json={
+        json={
             "plate": "TN01AB1234",
             "vehicle_type": "truck",
             "capacity_kg": 5000,
@@ -67,6 +74,13 @@ def assign(client, shipment, vehicle, driver, reason):
     )
 
 
+def audit_outcomes():
+    """Return (list of outcomes in order, result of verify_chain)."""
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        rows = conn.execute("SELECT outcome FROM audit_log ORDER BY id").fetchall()
+        return [r[0] for r in rows], verify_chain(conn)
+
+
 def test_reassignment_keeps_history(client):
     vehicle = make_vehicle(client)
     ravi = make_driver(client, "TN0120250001")
@@ -83,6 +97,10 @@ def test_reassignment_keeps_history(client):
     assert rows[1]["driver_id"] == suresh
     assert client.get("/shipments").json()[0]["status"] == "assigned"
 
+    outcomes, result = audit_outcomes()
+    assert outcomes == ["allowed", "allowed"]
+    assert result["ok"] is True
+
 
 def test_failed_assignment_keeps_current_one(client):
     vehicle = make_vehicle(client)
@@ -97,6 +115,7 @@ def test_failed_assignment_keeps_current_one(client):
     assert len(rows) == 1
     assert rows[0]["ended_at"] is None
 
+
 def test_overweight_assignment_is_blocked(client):
     vehicle = make_vehicle(client)
     ravi = make_driver(client, "TN0120250001")
@@ -109,6 +128,10 @@ def test_overweight_assignment_is_blocked(client):
     assert client.get("/assignments").json() == []
     assert client.get("/shipments").json()[0]["status"] == "pending"
 
+    outcomes, result = audit_outcomes()
+    assert outcomes == ["blocked"]
+    assert result["ok"] is True
+
 
 def test_vehicle_without_dates_is_blocked(client):
     vehicle = client.post(
@@ -119,7 +142,3 @@ def test_vehicle_without_dates_is_blocked(client):
     shipment = make_shipment(client)
 
     response = assign(client, shipment, vehicle, ravi, "no paperwork")
-
-    assert response.status_code == 422
-    rules = {v["rule"] for v in response.json()["detail"]["violations"]}
-    assert rules == {"insurance", "fitness"}

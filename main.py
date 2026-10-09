@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from datetime import date
+from audit import append_audit, verify_chain
 import os
 
 import psycopg
@@ -199,7 +200,6 @@ def list_assignments():
         ).fetchall()
     return rows
 
-
 @app.post("/assignments")
 def create_assignment(assignment: AssignmentIn):
     with get_connection() as conn:
@@ -217,7 +217,18 @@ def create_assignment(assignment: AssignmentIn):
             status_code=400, detail="Shipment, vehicle or driver does not exist"
         )
     results = evaluate(vehicle, driver, shipment, date.today())
+    entity_id = str(assignment.shipment_id)
+    audit_details = {
+        "request": assignment.model_dump(),
+        "guardrail_results": [asdict(r) for r in results],
+    }
     if not is_allowed(results):
+        with get_connection() as conn:  # commits BEFORE the raise below
+            append_audit(
+                conn, "dispatcher", "assignment.create", "blocked",
+                entity_type="shipment", entity_id=entity_id,
+                details=audit_details,
+            )
         raise HTTPException(
             status_code=422,
             detail={
@@ -246,6 +257,11 @@ def create_assignment(assignment: AssignmentIn):
                 "UPDATE shipments SET status = 'assigned' WHERE id = %s",
                 (assignment.shipment_id,),
             )
+            append_audit(  # same transaction as the assignment
+                conn, "dispatcher", "assignment.create", "allowed",
+                entity_type="shipment", entity_id=entity_id,
+                details=audit_details,
+            )
     except psycopg.errors.ForeignKeyViolation:
         raise HTTPException(
             status_code=400,
@@ -257,3 +273,9 @@ def create_assignment(assignment: AssignmentIn):
             detail="This shipment already has an active assignment",
         )
     return {**row, **assignment.model_dump(), "warnings": [asdict(r) for r in results]}
+
+
+@app.get("/audit/verify")
+def verify_audit():
+    with get_connection() as conn:
+        return verify_chain(conn)
