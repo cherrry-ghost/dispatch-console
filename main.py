@@ -48,7 +48,7 @@ def list_vehicles():
 def create_vehicle(vehicle: VehicleIn):
     try:
         with get_connection() as conn:
-                        row = conn.execute(
+            row = conn.execute(
                 "INSERT INTO vehicles "
                 "(plate, vehicle_type, capacity_kg, insurance_expiry, fitness_expiry) "
                 "VALUES (%s, %s, %s, %s, %s) RETURNING id",
@@ -60,6 +60,11 @@ def create_vehicle(vehicle: VehicleIn):
                     vehicle.fitness_expiry,
                 ),
             ).fetchone()
+            append_audit(
+                conn, "dispatcher", "vehicle.create", "allowed",
+                entity_type="vehicle", entity_id=str(row["id"]),
+                details={"plate": vehicle.plate},
+            )
     except psycopg.errors.UniqueViolation:
         raise HTTPException(
             status_code=409, detail="A vehicle with this plate already exists"

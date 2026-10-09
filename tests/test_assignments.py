@@ -74,12 +74,17 @@ def assign(client, shipment, vehicle, driver, reason):
     )
 
 
-def audit_outcomes():
-    """Return (list of outcomes in order, result of verify_chain)."""
+def audit_outcomes(action=None):
+    """Return (outcomes in order, verify_chain result). Optionally filter by action."""
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
-        rows = conn.execute("SELECT outcome FROM audit_log ORDER BY id").fetchall()
+        if action:
+            rows = conn.execute(
+                "SELECT outcome FROM audit_log WHERE action = %s ORDER BY id",
+                (action,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT outcome FROM audit_log ORDER BY id").fetchall()
         return [r[0] for r in rows], verify_chain(conn)
-
 
 def test_reassignment_keeps_history(client):
     vehicle = make_vehicle(client)
@@ -97,7 +102,7 @@ def test_reassignment_keeps_history(client):
     assert rows[1]["driver_id"] == suresh
     assert client.get("/shipments").json()[0]["status"] == "assigned"
 
-    outcomes, result = audit_outcomes()
+    outcomes, result = audit_outcomes("assignment.create")
     assert outcomes == ["allowed", "allowed"]
     assert result["ok"] is True
 
@@ -128,7 +133,7 @@ def test_overweight_assignment_is_blocked(client):
     assert client.get("/assignments").json() == []
     assert client.get("/shipments").json()[0]["status"] == "pending"
 
-    outcomes, result = audit_outcomes()
+    outcomes, result = audit_outcomes("assignment.create")
     assert outcomes == ["blocked"]
     assert result["ok"] is True
 
