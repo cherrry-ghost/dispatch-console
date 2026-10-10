@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from datetime import date
+from uuid import uuid4
 from audit import append_audit, verify_chain
 import os
 
@@ -10,6 +11,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 from guardrails import evaluate, is_allowed
 from routing import shortest_route
+from planner import plan_shipments
 from typing import Literal
 from psycopg.types.json import Jsonb
 
@@ -470,3 +472,45 @@ def get_route(from_id: int, to_id: int):
             status_code=404, detail="No open route between these locations"
         )
     return result
+
+
+class PlannerRequest(BaseModel):
+    shipment_ids: list[int] | None = None  # None = all pending shipments
+
+
+@app.post("/planner/propose")
+def propose_plan(body: PlannerRequest):
+    with get_connection() as conn:
+        vehicles = conn.execute(
+            "SELECT * FROM vehicles ORDER BY id"
+        ).fetchall()
+        if body.shipment_ids is None:
+            shipments = conn.execute(
+                "SELECT * FROM shipments WHERE status = 'pending' ORDER BY id"
+            ).fetchall()
+        else:
+            shipments = conn.execute(
+                "SELECT * FROM shipments WHERE status = 'pending' "
+                "AND id = ANY(%s) ORDER BY id",
+                (body.shipment_ids,),
+            ).fetchall()
+        plan = plan_shipments(shipments, vehicles, date.today())
+        run_id = uuid4().hex[:12]
+        # The planner is an AI actor: the input snapshot, the recommendation
+        # and the skips are recorded before a human decides anything.
+        append_audit(
+            conn, "ai_planner", "plan.propose", "allowed",
+            entity_type="plan", entity_id=run_id,
+            details={
+                "model": "ortools-cp-sat", "model_version": 1,
+                "input": {
+                    "shipment_ids": [s["id"] for s in shipments],
+                    "vehicle_ids": [v["id"] for v in vehicles],
+                },
+                "proposal": plan["proposals"],
+                "vehicles": plan["vehicles"],
+                "skipped": plan["skipped"],
+                "summary": plan["summary"],
+            },
+        )
+    return {"plan_id": run_id, **plan}
