@@ -9,9 +9,11 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
-from guardrails import evaluate, is_allowed
+from guardrails import evaluate, is_allowed, route_label
 from routing import shortest_route
 from planner import plan_shipments
+from zones import split_edges_by_zones
+from validator import validate_route
 from typing import Literal
 from psycopg.types.json import Jsonb
 
@@ -459,19 +461,134 @@ def create_road_edge(edge: RoadEdgeIn):
     }
 
 
+class ZoneIn(BaseModel):
+    name: str
+    center_lat: float = Field(ge=-90, le=90)
+    center_lng: float = Field(ge=-180, le=180)
+    radius_km: float = Field(gt=0)
+
+
+@app.post("/zones")
+def create_zone(zone: ZoneIn):
+    with get_connection() as conn:
+        row = conn.execute(
+            "INSERT INTO zones (name, center_lat, center_lng, radius_km) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (zone.name, zone.center_lat, zone.center_lng, zone.radius_km),
+        ).fetchone()
+        append_audit(
+            conn, "dispatcher", "zone.create", "allowed",
+            entity_type="zone", entity_id=str(row["id"]),
+            details=zone.model_dump(),
+        )
+    return {"id": row["id"], **zone.model_dump(), "active": True}
+
+
+@app.get("/zones")
+def list_zones():
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, name, center_lat, center_lng, radius_km, active, "
+            "created_at FROM zones ORDER BY id"
+        ).fetchall()
+
+
+class ZoneStatusIn(BaseModel):
+    active: bool
+
+
+@app.post("/zones/{zone_id}/status")
+def set_zone_status(zone_id: int, body: ZoneStatusIn):
+    with get_connection() as conn:
+        row = conn.execute(
+            "UPDATE zones SET active = %s WHERE id = %s RETURNING id, name",
+            (body.active, zone_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Zone not found")
+        append_audit(
+            conn, "dispatcher", "zone.activate" if body.active
+            else "zone.deactivate", "allowed",
+            entity_type="zone", entity_id=str(zone_id),
+            details={"name": row["name"], "active": body.active},
+        )
+    return {"id": zone_id, "name": row["name"], "active": body.active}
+
+
 @app.get("/route")
 def get_route(from_id: int, to_id: int):
     with get_connection() as conn:
-        edges = conn.execute(
-            "SELECT from_location_id, to_location_id, distance_km, status, "
-            "risk_score FROM road_edges"
+        edges = conn.execute("SELECT * FROM road_edges").fetchall()
+        locations = {
+            r["id"]: r
+            for r in conn.execute(
+                "SELECT id, latitude, longitude FROM locations"
+            ).fetchall()
+        }
+        zones = conn.execute(
+            "SELECT * FROM zones WHERE active ORDER BY id"
         ).fetchall()
-    result = shortest_route(edges, from_id, to_id)
+
+    # Forbidden zones are removed from the network BEFORE routing.
+    allowed_edges, blocked = split_edges_by_zones(edges, zones, locations)
+    blocked_names = sorted({z["name"] for _, z in blocked})
+
+    result = shortest_route(allowed_edges, from_id, to_id)
     if result is None:
-        raise HTTPException(
-            status_code=404, detail="No open route between these locations"
+        reasons = (
+            [f"Forbidden zone(s) removed roads from the network: "
+             f"{', '.join(blocked_names)}."] if blocked_names else []
         )
-    return result
+        reasons.append("No connected open road remains between the two "
+                       "locations.")
+        with get_connection() as conn:
+            append_audit(
+                conn, "dispatcher", "route.request", "blocked",
+                entity_type="route",
+                details={"from": from_id, "to": to_id,
+                         "blocked_by_zones": blocked_names},
+            )
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "No open route between these locations",
+                "blocked_by_zones": blocked_names,
+                "reasons": reasons,
+            },
+        )
+
+    # Independent second check: re-verify the finished route against the raw
+    # zone data, with different geometry than the pre-routing filter.
+    violations = validate_route(result["path"], zones, locations)
+    if violations:
+        with get_connection() as conn:
+            append_audit(
+                conn, "dispatcher", "route.request", "blocked",
+                entity_type="route",
+                details={"from": from_id, "to": to_id,
+                         "validator": violations},
+            )
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Route rejected by the independent validator",
+                "violations": violations,
+            },
+        )
+
+    label = route_label(result["max_risk"])
+    if label == "needs_approval":
+        # High-risk routes stay visible but are flagged for a manager decision
+        # before anyone drives them (approval flow lands in Phase 6B).
+        with get_connection() as conn:
+            append_audit(
+                conn, "dispatcher", "route.request", "allowed",
+                entity_type="route",
+                details={"from": from_id, "to": to_id,
+                         "max_risk": result["max_risk"], "label": label,
+                         "note": "high risk: manager approval needed before use"},
+            )
+    return {**result, "label": label, "blocked_by_zones": blocked_names}
 
 
 class PlannerRequest(BaseModel):
