@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
 dispatch.db
+.pytest_cache/
+append_audit.txt
+*:Zone.Identifier
