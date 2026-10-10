@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 from guardrails import evaluate, is_allowed, route_label
-from routing import shortest_route
+from routing import shortest_route, ranked_routes
 from planner import plan_shipments
 from zones import split_edges_by_zones
 from validator import validate_route
@@ -352,22 +352,62 @@ def decide_approval(approval_id: int, body: DecisionIn):
         if ap["status"] != "pending":
             raise HTTPException(status_code=409, detail="Already decided")
         req = ap["request"]
+        entity_type = "route" if ap["action"] == "route.use" else "shipment"
         details = {"approval_id": approval_id, "note": body.note, "request": req}
         if body.decision == "approved":
-            # Data may have changed since the request (e.g. a licence expired).
-            vehicle, driver, shipment = load_entities(conn, req)
-            if vehicle is None or driver is None or shipment is None:
-                raise HTTPException(status_code=400, detail="Entity no longer exists")
-            results = evaluate(vehicle, driver, shipment, date.today())
-            if not is_allowed(results):
-                blocked = [asdict(r) for r in results]
-                append_audit(
-                    conn, "manager", "approval.decide", "blocked",
-                    entity_type="shipment", entity_id=ap["entity_id"],
-                    details={**details, "guardrail_results": blocked},
+            if ap["action"] == "route.use":
+                # Re-check the EXACT route that was requested: a zone,
+                # closure or incident may have appeared since the request.
+                requested_path = req.get("path") or []
+                edges = conn.execute(
+                    "SELECT * FROM road_edges").fetchall()
+                locations = {
+                    r["id"]: r
+                    for r in conn.execute(
+                        "SELECT id, latitude, longitude FROM locations"
+                    ).fetchall()
+                }
+                zones = conn.execute(
+                    "SELECT * FROM zones WHERE active ORDER BY id"
+                ).fetchall()
+                open_pairs = {
+                    (min(e["from_location_id"], e["to_location_id"]),
+                     max(e["from_location_id"], e["to_location_id"]))
+                    for e in edges if e["status"] == "open"
+                }
+                legs_open = all(
+                    (min(a, b), max(a, b)) in open_pairs
+                    for a, b in zip(requested_path, requested_path[1:])
                 )
+                violations = validate_route(requested_path, zones, locations)
+                if legs_open and not violations:
+                    details["route"] = {"path": requested_path}
+                else:
+                    blocked = violations or [{
+                        "rule": "route_gone",
+                        "message": "A road on the requested route is now "
+                                   "closed.",
+                    }]
+                    append_audit(
+                        conn, "manager", "approval.decide", "blocked",
+                        entity_type="route", entity_id=ap["entity_id"],
+                        details={**details, "guardrail_results": blocked},
+                    )
             else:
-                apply_assignment(conn, req)
+                # Data may have changed since the request (e.g. a licence expired).
+                vehicle, driver, shipment = load_entities(conn, req)
+                if vehicle is None or driver is None or shipment is None:
+                    raise HTTPException(status_code=400, detail="Entity no longer exists")
+                results = evaluate(vehicle, driver, shipment, date.today())
+                if not is_allowed(results):
+                    blocked = [asdict(r) for r in results]
+                    append_audit(
+                        conn, "manager", "approval.decide", "blocked",
+                        entity_type="shipment", entity_id=ap["entity_id"],
+                        details={**details, "guardrail_results": blocked},
+                    )
+                else:
+                    apply_assignment(conn, req)
         if blocked is None:
             conn.execute(
                 "UPDATE approvals SET status = %s, decided_by = 'manager', "
@@ -376,16 +416,16 @@ def decide_approval(approval_id: int, body: DecisionIn):
             )
             append_audit(
                 conn, "manager", f"approval.{body.decision}", body.decision,
-                entity_type="shipment", entity_id=ap["entity_id"],
+                entity_type=entity_type, entity_id=ap["entity_id"],
                 details=details,
             )
     if blocked:
+        message = ("Cannot approve: this route is no longer usable"
+                   if entity_type == "route"
+                   else "Cannot approve: guardrails now block this assignment")
         raise HTTPException(
             status_code=422,
-            detail={
-                "message": "Cannot approve: guardrails now block this assignment",
-                "violations": blocked,
-            },
+            detail={"message": message, "violations": blocked},
         )
     return {"approval_id": approval_id, "status": body.decision}
 
@@ -755,32 +795,52 @@ def get_incident(incident_id: int):
     return {**inc, "evidence": evidence}
 
 
-@app.get("/route")
-def get_route(from_id: int, to_id: int):
-    with get_connection() as conn:
-        edges = conn.execute("SELECT * FROM road_edges").fetchall()
-        locations = {
-            r["id"]: r
-            for r in conn.execute(
-                "SELECT id, latitude, longitude FROM locations"
-            ).fetchall()
-        }
-        zones = conn.execute(
-            "SELECT * FROM zones WHERE active ORDER BY id"
-        ).fetchall()
+def _compute_route(conn, from_id, to_id, risk_weight=0.0):
+    """Fetch the raw network, strip forbidden zones, find the best route.
 
-    # Forbidden zones are removed from the network BEFORE routing.
+    Returns (result_or_None, blocked_zone_names, zones, locations) so callers
+    can validate, label, and explain. Forbidden zones are removed from the
+    network BEFORE routing.
+    """
+    edges = conn.execute("SELECT * FROM road_edges").fetchall()
+    locations = {
+        r["id"]: r
+        for r in conn.execute(
+            "SELECT id, latitude, longitude FROM locations"
+        ).fetchall()
+    }
+    zones = conn.execute(
+        "SELECT * FROM zones WHERE active ORDER BY id"
+    ).fetchall()
     allowed_edges, blocked = split_edges_by_zones(edges, zones, locations)
     blocked_names = sorted({z["name"] for _, z in blocked})
+    result = shortest_route(allowed_edges, from_id, to_id, risk_weight)
+    return result, blocked_names, zones, locations
 
-    result = shortest_route(allowed_edges, from_id, to_id)
+
+def _no_route_error(blocked_names):
+    reasons = (
+        [f"Forbidden zone(s) removed roads from the network: "
+         f"{', '.join(blocked_names)}."] if blocked_names else []
+    )
+    reasons.append("No connected open road remains between the two "
+                   "locations.")
+    return HTTPException(
+        status_code=404,
+        detail={
+            "message": "No open route between these locations",
+            "blocked_by_zones": blocked_names,
+            "reasons": reasons,
+        },
+    )
+
+
+def _validated_route(from_id, to_id, risk_weight=0.0):
+    """Compute a route, run the independent validator, audit blocks. 404s."""
+    with get_connection() as conn:
+        result, blocked_names, zones, locations = _compute_route(
+            conn, from_id, to_id, risk_weight)
     if result is None:
-        reasons = (
-            [f"Forbidden zone(s) removed roads from the network: "
-             f"{', '.join(blocked_names)}."] if blocked_names else []
-        )
-        reasons.append("No connected open road remains between the two "
-                       "locations.")
         with get_connection() as conn:
             append_audit(
                 conn, "dispatcher", "route.request", "blocked",
@@ -788,17 +848,7 @@ def get_route(from_id: int, to_id: int):
                 details={"from": from_id, "to": to_id,
                          "blocked_by_zones": blocked_names},
             )
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": "No open route between these locations",
-                "blocked_by_zones": blocked_names,
-                "reasons": reasons,
-            },
-        )
-
-    # Independent second check: re-verify the finished route against the raw
-    # zone data, with different geometry than the pre-routing filter.
+        raise _no_route_error(blocked_names)
     violations = validate_route(result["path"], zones, locations)
     if violations:
         with get_connection() as conn:
@@ -815,11 +865,21 @@ def get_route(from_id: int, to_id: int):
                 "violations": violations,
             },
         )
+    return result, blocked_names
 
+
+class RouteUseIn(BaseModel):
+    from_id: int
+    to_id: int
+    prefer: Literal["fast", "safe"] = "safe"
+
+
+@app.get("/route")
+def get_route(from_id: int, to_id: int, prefer: Literal["fast", "safe"] = "fast"):
+    risk_weight = 1.0 if prefer == "safe" else 0.0
+    result, blocked_names = _validated_route(from_id, to_id, risk_weight)
     label = route_label(result["max_risk"])
     if label == "needs_approval":
-        # High-risk routes stay visible but are flagged for a manager decision
-        # before anyone drives them (approval flow lands in Phase 6B).
         with get_connection() as conn:
             append_audit(
                 conn, "dispatcher", "route.request", "allowed",
@@ -829,6 +889,64 @@ def get_route(from_id: int, to_id: int):
                          "note": "high risk: manager approval needed before use"},
             )
     return {**result, "label": label, "blocked_by_zones": blocked_names}
+
+
+@app.get("/routes")
+def list_routes(from_id: int, to_id: int):
+    """Up to 3 ranked alternatives, safest-weighted choice first."""
+    with get_connection() as conn:
+        edges = conn.execute("SELECT * FROM road_edges").fetchall()
+        locations = {
+            r["id"]: r
+            for r in conn.execute(
+                "SELECT id, latitude, longitude FROM locations"
+            ).fetchall()
+        }
+        zones = conn.execute(
+            "SELECT * FROM zones WHERE active ORDER BY id"
+        ).fetchall()
+        allowed_edges, blocked = split_edges_by_zones(edges, zones, locations)
+        routes = ranked_routes(allowed_edges, from_id, to_id)
+    blocked_names = sorted({z["name"] for _, z in blocked})
+    if not routes:
+        raise _no_route_error(blocked_names)
+    for r in routes:
+        r["label"] = route_label(r["max_risk"])
+    return {
+        "routes": routes,
+        "recommended": routes[0],
+        "blocked_by_zones": blocked_names,
+    }
+
+
+@app.post("/route/use-request")
+def request_route_use(body: RouteUseIn, response: Response):
+    """Ask to USE a route. High-risk (orange) routes need manager approval."""
+    risk_weight = 1.0 if body.prefer == "safe" else 0.0
+    result, blocked_names = _validated_route(
+        body.from_id, body.to_id, risk_weight)
+    label = route_label(result["max_risk"])
+    request = {**body.model_dump(), "path": result["path"]}
+    if label != "needs_approval":
+        return {"status": "not_required", "label": label, "route": result}
+    with get_connection() as conn:
+        approval = conn.execute(
+            "INSERT INTO approvals (action, entity_type, entity_id, request, "
+            "warnings, requested_by) "
+            "VALUES ('route.use', 'route', %s, %s, %s, 'dispatcher') "
+            "RETURNING id",
+            (f"{body.from_id}->{body.to_id}", Jsonb(request), Jsonb([])),
+        ).fetchone()
+        append_audit(
+            conn, "dispatcher", "route.use_request", "pending",
+            entity_type="route", entity_id=f"{body.from_id}->{body.to_id}",
+            details={"approval_id": approval["id"], "request": request,
+                     "route": result, "label": label,
+                     "blocked_by_zones": blocked_names},
+        )
+    response.status_code = 202
+    return {"status": "pending_approval", "approval_id": approval["id"],
+            "label": label, "route": result}
 
 
 class PlannerRequest(BaseModel):
