@@ -9,6 +9,7 @@ import {
 import "leaflet/dist/leaflet.css";
 import AuditViewer from "./AuditViewer";
 import AssignmentForm from "./AssignmentForm";
+import ApprovalsPanel from "./ApprovalsPanel";
 
 const API_URL = "http://localhost:8010";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments"];
@@ -121,6 +122,10 @@ function App() {
         shipments={shipments}
         vehicles={vehicles}
         drivers={drivers}
+        onDone={() => setVersion((v) => v + 1)}
+      />
+      <ApprovalsPanel
+        refreshKey={version}
         onDone={() => setVersion((v) => v + 1)}
       />
       <AuditViewer refreshKey={version} />

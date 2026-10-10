@@ -4,13 +4,14 @@ from audit import append_audit, verify_chain
 import os
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 from guardrails import evaluate, is_allowed
 from routing import shortest_route
 from typing import Literal
+from psycopg.types.json import Jsonb
 
 app = FastAPI()
 app.add_middleware(
@@ -213,28 +214,51 @@ def list_assignments():
         ).fetchall()
     return rows
 
+def apply_assignment(conn, req):
+    """Close the shipment's old assignment, create the new one, mark shipment assigned."""
+    conn.execute(
+        "UPDATE assignments SET ended_at = now() "
+        "WHERE shipment_id = %s AND ended_at IS NULL",
+        (req["shipment_id"],),
+    )
+    row = conn.execute(
+        "INSERT INTO assignments (shipment_id, vehicle_id, driver_id, reason) "
+        "VALUES (%s, %s, %s, %s) RETURNING id, started_at",
+        (req["shipment_id"], req["vehicle_id"], req["driver_id"], req["reason"]),
+    ).fetchone()
+    conn.execute(
+        "UPDATE shipments SET status = 'assigned' WHERE id = %s",
+        (req["shipment_id"],),
+    )
+    return row
+
+
+def load_entities(conn, req):
+    vehicle = conn.execute(
+        "SELECT * FROM vehicles WHERE id = %s", (req["vehicle_id"],)
+    ).fetchone()
+    driver = conn.execute(
+        "SELECT * FROM drivers WHERE id = %s", (req["driver_id"],)
+    ).fetchone()
+    shipment = conn.execute(
+        "SELECT * FROM shipments WHERE id = %s", (req["shipment_id"],)
+    ).fetchone()
+    return vehicle, driver, shipment
+
+
 @app.post("/assignments")
-def create_assignment(assignment: AssignmentIn):
+def create_assignment(assignment: AssignmentIn, response: Response):
+    req = assignment.model_dump()
     with get_connection() as conn:
-        vehicle = conn.execute(
-            "SELECT * FROM vehicles WHERE id = %s", (assignment.vehicle_id,)
-        ).fetchone()
-        driver = conn.execute(
-            "SELECT * FROM drivers WHERE id = %s", (assignment.driver_id,)
-        ).fetchone()
-        shipment = conn.execute(
-            "SELECT * FROM shipments WHERE id = %s", (assignment.shipment_id,)
-        ).fetchone()
+        vehicle, driver, shipment = load_entities(conn, req)
     if vehicle is None or driver is None or shipment is None:
         raise HTTPException(
             status_code=400, detail="Shipment, vehicle or driver does not exist"
         )
     results = evaluate(vehicle, driver, shipment, date.today())
     entity_id = str(assignment.shipment_id)
-    audit_details = {
-        "request": assignment.model_dump(),
-        "guardrail_results": [asdict(r) for r in results],
-    }
+    warnings = [asdict(r) for r in results]
+    audit_details = {"request": req, "guardrail_results": warnings}
     if not is_allowed(results):
         with get_connection() as conn:  # commits BEFORE the raise below
             append_audit(
@@ -246,30 +270,32 @@ def create_assignment(assignment: AssignmentIn):
             status_code=422,
             detail={
                 "message": "Assignment blocked by guardrails",
-                "violations": [asdict(r) for r in results],
+                "violations": warnings,
             },
         )
     try:
         with get_connection() as conn:
-            conn.execute(
-                "UPDATE assignments SET ended_at = now() "
-                "WHERE shipment_id = %s AND ended_at IS NULL",
-                (assignment.shipment_id,),
-            )
-            row = conn.execute(
-                "INSERT INTO assignments (shipment_id, vehicle_id, driver_id, reason) "
-                "VALUES (%s, %s, %s, %s) RETURNING id, started_at",
-                (
-                    assignment.shipment_id,
-                    assignment.vehicle_id,
-                    assignment.driver_id,
-                    assignment.reason,
-                ),
-            ).fetchone()
-            conn.execute(
-                "UPDATE shipments SET status = 'assigned' WHERE id = %s",
-                (assignment.shipment_id,),
-            )
+            if warnings:
+                # Risky but not forbidden: park it until a manager decides.
+                approval = conn.execute(
+                    "INSERT INTO approvals (action, entity_type, entity_id, "
+                    "request, warnings, requested_by) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    ("assignment.create", "shipment", entity_id,
+                     Jsonb(req), Jsonb(warnings), "dispatcher"),
+                ).fetchone()
+                append_audit(
+                    conn, "dispatcher", "assignment.request_approval", "pending",
+                    entity_type="shipment", entity_id=entity_id,
+                    details={**audit_details, "approval_id": approval["id"]},
+                )
+                response.status_code = 202
+                return {
+                    "status": "pending_approval",
+                    "approval_id": approval["id"],
+                    "warnings": warnings,
+                }
+            row = apply_assignment(conn, req)
             append_audit(  # same transaction as the assignment
                 conn, "dispatcher", "assignment.create", "allowed",
                 entity_type="shipment", entity_id=entity_id,
@@ -285,7 +311,78 @@ def create_assignment(assignment: AssignmentIn):
             status_code=409,
             detail="This shipment already has an active assignment",
         )
-    return {**row, **assignment.model_dump(), "warnings": [asdict(r) for r in results]}
+    return {**row, **req, "warnings": []}
+
+
+@app.get("/approvals")
+def list_approvals(status: str | None = None):
+    query = (
+        "SELECT id, created_at, action, entity_type, entity_id, request, "
+        "warnings, status, requested_by, decided_by, decided_at, decision_note "
+        "FROM approvals"
+    )
+    params = ()
+    if status:
+        query += " WHERE status = %s"
+        params = (status,)
+    query += " ORDER BY id DESC"
+    with get_connection() as conn:
+        return conn.execute(query, params).fetchall()
+
+
+class DecisionIn(BaseModel):
+    decision: Literal["approved", "rejected"]
+    note: str = ""
+
+
+@app.post("/approvals/{approval_id}/decision")
+def decide_approval(approval_id: int, body: DecisionIn):
+    blocked = None
+    with get_connection() as conn:
+        ap = conn.execute(
+            "SELECT * FROM approvals WHERE id = %s FOR UPDATE", (approval_id,)
+        ).fetchone()
+        if ap is None:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        if ap["status"] != "pending":
+            raise HTTPException(status_code=409, detail="Already decided")
+        req = ap["request"]
+        details = {"approval_id": approval_id, "note": body.note, "request": req}
+        if body.decision == "approved":
+            # Data may have changed since the request (e.g. a licence expired).
+            vehicle, driver, shipment = load_entities(conn, req)
+            if vehicle is None or driver is None or shipment is None:
+                raise HTTPException(status_code=400, detail="Entity no longer exists")
+            results = evaluate(vehicle, driver, shipment, date.today())
+            if not is_allowed(results):
+                blocked = [asdict(r) for r in results]
+                append_audit(
+                    conn, "manager", "approval.decide", "blocked",
+                    entity_type="shipment", entity_id=ap["entity_id"],
+                    details={**details, "guardrail_results": blocked},
+                )
+            else:
+                apply_assignment(conn, req)
+        if blocked is None:
+            conn.execute(
+                "UPDATE approvals SET status = %s, decided_by = 'manager', "
+                "decided_at = now(), decision_note = %s WHERE id = %s",
+                (body.decision, body.note, approval_id),
+            )
+            append_audit(
+                conn, "manager", f"approval.{body.decision}", body.decision,
+                entity_type="shipment", entity_id=ap["entity_id"],
+                details=details,
+            )
+    if blocked:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Cannot approve: guardrails now block this assignment",
+                "violations": blocked,
+            },
+        )
+    return {"approval_id": approval_id, "status": body.decision}
 
 
 @app.get("/audit/verify")

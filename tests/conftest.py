@@ -18,7 +18,7 @@ def clean_database():
     """Empty every table before each test so each one starts from a blank slate."""
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute(
-           "TRUNCATE audit_log, road_edges, assignments, shipments, drivers, vehicles, locations "
+           "TRUNCATE audit_log, approvals,  road_edges, assignments, shipments, drivers, vehicles, locations "
             "RESTART IDENTITY"
         )
     yield
