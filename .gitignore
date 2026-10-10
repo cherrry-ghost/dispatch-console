@@ -4,3 +4,4 @@ dispatch.db
 .pytest_cache/
 append_audit.txt
 *:Zone.Identifier
+evidence/

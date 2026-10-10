@@ -2,10 +2,11 @@ from dataclasses import asdict
 from datetime import date
 from uuid import uuid4
 from audit import append_audit, verify_chain
+import hashlib
 import os
 
 import psycopg
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
@@ -513,6 +514,245 @@ def set_zone_status(zone_id: int, body: ZoneStatusIn):
             details={"name": row["name"], "active": body.active},
         )
     return {"id": zone_id, "name": row["name"], "active": body.active}
+
+
+class RoadStatusIn(BaseModel):
+    status: Literal["open", "closed"]
+
+
+@app.post("/road-edges/{edge_id}/status")
+def set_road_status(edge_id: int, body: RoadStatusIn):
+    with get_connection() as conn:
+        row = conn.execute(
+            "UPDATE road_edges SET status = %s WHERE id = %s "
+            "RETURNING from_location_id, to_location_id",
+            (body.status, edge_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Road not found")
+        append_audit(
+            conn, "dispatcher", "road_edge.status_change", "allowed",
+            entity_type="road_edge", entity_id=str(edge_id),
+            details={"road": [row["from_location_id"],
+                              row["to_location_id"]],
+                     "status": body.status},
+        )
+    return {"id": edge_id, "status": body.status}
+
+
+class IncidentIn(BaseModel):
+    description: str = Field(min_length=1)
+    incident_type: str
+    road_edge_id: int | None = None
+
+
+@app.post("/incidents")
+def report_incident(incident: IncidentIn):
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO incidents (description, incident_type, "
+                "road_edge_id) VALUES (%s, %s, %s) RETURNING id, status, "
+                "reported_at",
+                (incident.description, incident.incident_type,
+                 incident.road_edge_id),
+            ).fetchone()
+            append_audit(
+                conn, "dispatcher", "incident.reported", "allowed",
+                entity_type="incident", entity_id=str(row["id"]),
+                details=incident.model_dump(),
+            )
+    except psycopg.errors.ForeignKeyViolation:
+        raise HTTPException(status_code=400, detail="Road does not exist")
+    return {"id": row["id"], "status": row["status"],
+            "reported_at": row["reported_at"], **incident.model_dump()}
+
+
+@app.get("/incidents")
+def list_incidents(status: str | None = None):
+    query = (
+        "SELECT i.id, i.description, i.incident_type, i.road_edge_id, "
+        "i.status, i.reported_by, i.reported_at, i.decided_by, i.decided_at, "
+        "i.resolved_at, "
+        "(SELECT count(*) FROM incident_evidence e "
+        " WHERE e.incident_id = i.id) AS evidence_count "
+        "FROM incidents i"
+    )
+    params = ()
+    if status:
+        query += " WHERE i.status = %s"
+        params = (status,)
+    query += " ORDER BY i.id DESC"
+    with get_connection() as conn:
+        return conn.execute(query, params).fetchall()
+
+
+def _load_incident(conn, incident_id):
+    row = conn.execute(
+        "SELECT * FROM incidents WHERE id = %s FOR UPDATE", (incident_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return row
+
+
+def _set_road_for_incident(conn, road_edge_id, closed):
+    conn.execute(
+        "UPDATE road_edges SET status = %s WHERE id = %s",
+        ("closed" if closed else "open", road_edge_id),
+    )
+
+
+@app.post("/incidents/{incident_id}/verify")
+def verify_incident(incident_id: int):
+    with get_connection() as conn:
+        inc = _load_incident(conn, incident_id)
+        if inc["status"] != "reported":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot verify an incident that is {inc['status']}",
+            )
+        conn.execute(
+            "UPDATE incidents SET status = 'verified', decided_by = 'manager', "
+            "decided_at = now() WHERE id = %s", (incident_id,),
+        )
+        road_closed = inc["road_edge_id"] is not None
+        if road_closed:
+            _set_road_for_incident(conn, inc["road_edge_id"], True)
+        append_audit(
+            conn, "manager", "incident.verified", "allowed",
+            entity_type="incident", entity_id=str(incident_id),
+            details={"description": inc["description"],
+                     "road_edge_id": inc["road_edge_id"],
+                     "road_closed": road_closed,
+                     "evidence_count": conn.execute(
+                         "SELECT count(*) AS n FROM incident_evidence "
+                         "WHERE incident_id = %s", (incident_id,),
+                     ).fetchone()["n"]},
+        )
+    return {"id": incident_id, "status": "verified",
+            "road_closed": road_closed}
+
+
+@app.post("/incidents/{incident_id}/dismiss")
+def dismiss_incident(incident_id: int):
+    with get_connection() as conn:
+        inc = _load_incident(conn, incident_id)
+        if inc["status"] != "reported":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot dismiss an incident that is {inc['status']}",
+            )
+        conn.execute(
+            "UPDATE incidents SET status = 'dismissed', decided_by = 'manager', "
+            "decided_at = now() WHERE id = %s", (incident_id,),
+        )
+        append_audit(
+            conn, "manager", "incident.dismissed", "allowed",
+            entity_type="incident", entity_id=str(incident_id),
+            details={"description": inc["description"]},
+        )
+    return {"id": incident_id, "status": "dismissed"}
+
+
+@app.post("/incidents/{incident_id}/resolve")
+def resolve_incident(incident_id: int):
+    with get_connection() as conn:
+        inc = _load_incident(conn, incident_id)
+        if inc["status"] != "verified":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot resolve an incident that is {inc['status']}",
+            )
+        conn.execute(
+            "UPDATE incidents SET status = 'resolved', resolved_at = now() "
+            "WHERE id = %s", (incident_id,),
+        )
+        road_reopened = False
+        if inc["road_edge_id"] is not None:
+            others = conn.execute(
+                "SELECT count(*) AS n FROM incidents WHERE road_edge_id = %s "
+                "AND id <> %s AND status = 'verified'",
+                (inc["road_edge_id"], incident_id),
+            ).fetchone()
+            if others["n"] == 0:
+                _set_road_for_incident(conn, inc["road_edge_id"], False)
+                road_reopened = True
+        append_audit(
+            conn, "manager", "incident.resolved", "allowed",
+            entity_type="incident", entity_id=str(incident_id),
+            details={"road_edge_id": inc["road_edge_id"],
+                     "road_reopened": road_reopened},
+        )
+    return {"id": incident_id, "status": "resolved",
+            "road_reopened": road_reopened}
+
+
+EVIDENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "evidence")
+MAX_EVIDENCE_BYTES = 20 * 1024 * 1024  # 20 MB, photos or short videos
+
+
+@app.post("/incidents/{incident_id}/evidence")
+async def attach_evidence(incident_id: int, file: UploadFile):
+    content = await file.read()
+    if len(content) > MAX_EVIDENCE_BYTES:
+        raise HTTPException(status_code=413, detail="File is larger than 20 MB")
+    if not content:
+        raise HTTPException(status_code=422, detail="Empty file")
+    digest = hashlib.sha256(content).hexdigest()
+    safe_name = os.path.basename(file.filename or "evidence")
+    with get_connection() as conn:
+        inc = conn.execute(
+            "SELECT status FROM incidents WHERE id = %s", (incident_id,)
+        ).fetchone()
+        if inc is None:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        if inc["status"] not in ("reported", "verified"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Evidence cannot be attached to a {inc['status']} "
+                       "incident",
+            )
+        row = conn.execute(
+            "INSERT INTO incident_evidence (incident_id, filename, "
+            "content_type, size_bytes, sha256) VALUES (%s, %s, %s, %s, %s) "
+            "RETURNING id, uploaded_at",
+            (incident_id, safe_name, file.content_type or "application/octet-stream",
+             len(content), digest),
+        ).fetchone()
+        # The audit stores WHO attached WHAT hash WHEN - never the file itself.
+        append_audit(
+            conn, "dispatcher", "evidence.attached", "allowed",
+            entity_type="incident", entity_id=str(incident_id),
+            details={"evidence_id": row["id"], "filename": safe_name,
+                     "size_bytes": len(content), "sha256": digest,
+                     "content_type": file.content_type},
+        )
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    with open(os.path.join(EVIDENCE_DIR, f"{digest}_{safe_name}"), "wb") as f:
+        f.write(content)
+    return {"id": row["id"], "incident_id": incident_id,
+            "filename": safe_name, "size_bytes": len(content),
+            "sha256": digest, "uploaded_at": row["uploaded_at"]}
+
+
+@app.get("/incidents/{incident_id}")
+def get_incident(incident_id: int):
+    with get_connection() as conn:
+        inc = conn.execute(
+            "SELECT id, description, incident_type, road_edge_id, status, "
+            "reported_by, reported_at, decided_by, decided_at, resolved_at "
+            "FROM incidents WHERE id = %s", (incident_id,),
+        ).fetchone()
+        if inc is None:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        evidence = conn.execute(
+            "SELECT id, filename, content_type, size_bytes, sha256, "
+            "uploaded_by, uploaded_at FROM incident_evidence "
+            "WHERE incident_id = %s ORDER BY id", (incident_id,),
+        ).fetchall()
+    return {**inc, "evidence": evidence}
 
 
 @app.get("/route")
