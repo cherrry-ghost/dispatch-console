@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 const API_URL = "http://localhost:8010";
 const OUTCOME_COLOR = { allowed: "#16a34a", blocked: "#dc2626", warning: "#ca8a04" };
 
-export default function AuditViewer() {
+export default function AuditViewer({ refreshKey }) {
   const [rows, setRows] = useState([]);
   const [error, setError] = useState(null);
   const [verify, setVerify] = useState(null);
@@ -19,7 +19,7 @@ export default function AuditViewer() {
 
   useEffect(() => {
     load();
-  }, []);
+  }, [refreshKey]);
 
   const runVerify = () =>
     fetch(`${API_URL}/audit/verify`)

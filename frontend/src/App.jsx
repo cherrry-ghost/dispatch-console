@@ -8,6 +8,7 @@ import {
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import AuditViewer from "./AuditViewer";
+import AssignmentForm from "./AssignmentForm";
 
 const API_URL = "http://localhost:8010";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments"];
@@ -18,6 +19,7 @@ function App() {
     vehicles: [], drivers: [], locations: [], shipments: [], assignments: [],
   });
   const [error, setError] = useState(null);
+  const [version, setVersion] = useState(0); // bump to reload everything
 
   useEffect(() => {
     Promise.all(
@@ -32,7 +34,7 @@ function App() {
         setData(Object.fromEntries(NAMES.map((n, i) => [n, results[i]])))
       )
       .catch((err) => setError(err.message));
-  }, []);
+  }, [version]);
 
   const { vehicles, drivers, locations, shipments, assignments } = data;
   const locById = Object.fromEntries(locations.map((l) => [l.id, l]));
@@ -114,7 +116,14 @@ function App() {
           ))}
         </tbody>
       </table>
-      <AuditViewer />
+
+      <AssignmentForm
+        shipments={shipments}
+        vehicles={vehicles}
+        drivers={drivers}
+        onDone={() => setVersion((v) => v + 1)}
+      />
+      <AuditViewer refreshKey={version} />
     </div>
   );
 }
