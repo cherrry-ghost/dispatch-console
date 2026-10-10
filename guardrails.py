@@ -87,3 +87,15 @@ def evaluate(vehicle, driver, shipment, today):
 
 def is_allowed(results):
     return not any(r.severity == "block" for r in results)
+
+
+RISK_APPROVAL_THRESHOLD = 70
+
+
+def route_label(max_risk):
+    """Safety label for a final route (roadmap: green / yellow / orange)."""
+    if max_risk >= RISK_APPROVAL_THRESHOLD:
+        return "needs_approval"
+    if max_risk > 0:
+        return "caution"
+    return "safe"
