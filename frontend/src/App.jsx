@@ -7,6 +7,7 @@ import {
   Tooltip,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+import AuditViewer from "./AuditViewer";
 
 const API_URL = "http://localhost:8010";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments"];
@@ -113,6 +114,7 @@ function App() {
           ))}
         </tbody>
       </table>
+      <AuditViewer />
     </div>
   );
 }

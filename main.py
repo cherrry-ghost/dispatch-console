@@ -293,6 +293,18 @@ def verify_audit():
     with get_connection() as conn:
         return verify_chain(conn)
 
+@app.get("/audit")
+def list_audit(limit: int = 50):
+    limit = max(1, min(limit, 500))  # keep it between 1 and 500 rows
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, actor_type, actor_id, action, entity_type, "
+            "entity_id, outcome, details, hash FROM audit_log "
+            "ORDER BY id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+    return rows
+
 
 class RoadEdgeIn(BaseModel):
     from_location_id: int
