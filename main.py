@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 from guardrails import evaluate, is_allowed
+from routing import shortest_route
+from typing import Literal
 
 app = FastAPI()
 app.add_middleware(
@@ -290,3 +292,72 @@ def create_assignment(assignment: AssignmentIn):
 def verify_audit():
     with get_connection() as conn:
         return verify_chain(conn)
+
+
+class RoadEdgeIn(BaseModel):
+    from_location_id: int
+    to_location_id: int
+    distance_km: float = Field(gt=0)
+    status: Literal["open", "closed"] = "open"
+    risk_score: int = Field(default=0, ge=0, le=100)
+
+
+@app.get("/road-edges")
+def list_road_edges():
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, from_location_id, to_location_id, distance_km, status, "
+            "risk_score FROM road_edges ORDER BY id"
+        ).fetchall()
+    return rows
+
+
+@app.post("/road-edges")
+def create_road_edge(edge: RoadEdgeIn):
+    if edge.from_location_id == edge.to_location_id:
+        raise HTTPException(
+            status_code=400, detail="A road must connect two different locations"
+        )
+    a, b = sorted((edge.from_location_id, edge.to_location_id))
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO road_edges "
+                "(from_location_id, to_location_id, distance_km, status, risk_score) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (a, b, edge.distance_km, edge.status, edge.risk_score),
+            ).fetchone()
+            append_audit(
+                conn, "dispatcher", "road_edge.create", "allowed",
+                entity_type="road_edge", entity_id=str(row["id"]),
+                details={
+                    "from": a, "to": b, "distance_km": edge.distance_km,
+                    "status": edge.status, "risk_score": edge.risk_score,
+                },
+            )
+    except psycopg.errors.ForeignKeyViolation:
+        raise HTTPException(status_code=400, detail="A location does not exist")
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(
+            status_code=409, detail="A road between these locations already exists"
+        )
+    return {
+        "id": row["id"], "from_location_id": a, "to_location_id": b,
+        "distance_km": edge.distance_km, "status": edge.status,
+        "risk_score": edge.risk_score,
+    }
+
+
+@app.get("/route")
+def get_route(from_id: int, to_id: int):
+    with get_connection() as conn:
+        edges = conn.execute(
+            "SELECT from_location_id, to_location_id, distance_km, status, "
+            "risk_score FROM road_edges"
+        ).fetchall()
+    result = shortest_route(edges, from_id, to_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail="No open route between these locations"
+        )
+    return result
