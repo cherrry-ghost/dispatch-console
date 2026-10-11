@@ -10,6 +10,7 @@ import "leaflet/dist/leaflet.css";
 import AuditViewer from "./AuditViewer";
 import AssignmentForm from "./AssignmentForm";
 import ApprovalsPanel from "./ApprovalsPanel";
+import EventsFeed from "./EventsFeed";
 import LiveVehicles from "./LiveVehicles";
 
 const API_URL = "http://localhost:8010";
@@ -124,6 +125,7 @@ function App() {
           window.alert(text + " — live tracking has flagged this.")
         }
       />
+      <EventsFeed />
 
       <AssignmentForm
         shipments={shipments}
