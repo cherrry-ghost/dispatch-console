@@ -53,6 +53,8 @@ function EventsFeed() {
         return `Road #${e.details?.road_edge_id} reopened`;
       case "assignment.created":
         return `Shipment #${e.shipment_id} assigned to vehicle #${e.vehicle_id}`;
+      case "notification.sent":
+        return `Customer told (shipment #${e.shipment_id}): ${e.details?.kind} — "${e.details?.message}"`;
       default:
         return e.kind;
     }

@@ -12,6 +12,7 @@ import AssignmentForm from "./AssignmentForm";
 import ApprovalsPanel from "./ApprovalsPanel";
 import EventsFeed from "./EventsFeed";
 import LiveVehicles from "./LiveVehicles";
+import NotificationsPanel from "./NotificationsPanel";
 
 const API_URL = "http://localhost:8010";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments"];
@@ -126,6 +127,7 @@ function App() {
         }
       />
       <EventsFeed />
+      <NotificationsPanel />
 
       <AssignmentForm
         shipments={shipments}

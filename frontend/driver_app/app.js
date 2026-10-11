@@ -129,8 +129,45 @@ function render(data, driverId) {
         <label>Photo proof (optional): <input type="file" accept="image/*"
                capture="environment" id="photo-${j.assignment_id}" /></label>
         <button data-deliver="${j.assignment_id}">Mark delivered</button>
+        <details class="incident">
+          <summary>Report a problem on this job</summary>
+          <select id="inc-type-${j.assignment_id}">
+            <option value="road_blocked">Road blocked</option>
+            <option value="accident">Accident</option>
+            <option value="protest">Protest / crowd</option>
+            <option value="breakdown">Vehicle breakdown</option>
+            <option value="other">Other</option>
+          </select>
+          <input type="text" placeholder="What happened? (short)"
+                 id="inc-note-${j.assignment_id}" />
+          <button data-incident="${j.assignment_id}">Send report</button>
+        </details>
       </div>
     </div>`).join("");
+
+  $("jobs").querySelectorAll("[data-incident]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.incident;
+      const box = btn.closest(".incident");
+      const kind = $(`inc-type-${id}`).value;
+      const note = $(`inc-note-${id}`).value.trim();
+      if (!note) { alert("Please write one short line about what happened."); return; }
+      btn.disabled = true;
+      btn.textContent = "Sending…";
+      try {
+        const res = await fetch(
+          `/driver/${driverId}/jobs/${id}/incident`,
+          { method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ description: note, incident_type: kind }) });
+        if (!res.ok) throw new Error(await res.text());
+        box.innerHTML = `<span class="reported">✔ Report sent — the office and the customer are informed.</span>`;
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = "Retry";
+        alert("Could not send report: " + err.message);
+      }
+    });
+  });
 
   $("jobs").querySelectorAll("[data-deliver]").forEach((btn) => {
     btn.addEventListener("click", async () => {
