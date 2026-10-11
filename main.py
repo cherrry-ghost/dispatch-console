@@ -29,6 +29,7 @@ from delay_model import (
 from typing import Literal
 from psycopg.types.json import Jsonb
 from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from events import check_geofences, emit, hub
 
 app = FastAPI()
@@ -38,6 +39,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The driver PWA is plain files (no build step) served by the API itself,
+# so a phone only needs the backend to install and use it.
+DRIVER_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "frontend", "driver_app")
+if os.path.isdir(DRIVER_APP_DIR):
+    app.mount("/driver-app", StaticFiles(directory=DRIVER_APP_DIR, html=True),
+              name="driver-app")
 
 class LiveManager:
     """Tracks console viewers on /ws/live and pushes new positions to them."""
@@ -987,6 +996,108 @@ def resolve_incident(incident_id: int):
 EVIDENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "evidence")
 MAX_EVIDENCE_BYTES = 20 * 1024 * 1024  # 20 MB, photos or short videos
+
+
+@app.get("/driver/{driver_id}/jobs")
+def driver_jobs(driver_id: int):
+    """The driver app's work list: active assignments for one driver only."""
+    with get_connection() as conn:
+        driver = conn.execute(
+            "SELECT id, full_name FROM drivers WHERE id = %s", (driver_id,)
+        ).fetchone()
+        if driver is None:
+            raise HTTPException(status_code=404, detail="Driver not found")
+        jobs = conn.execute(
+            "SELECT a.id AS assignment_id, a.started_at, "
+            "s.id AS shipment_id, s.description, s.weight_kg, s.status, "
+            "s.ready_minute, s.deadline_minute, "
+            "o.name AS origin_name, o.latitude AS origin_lat, "
+            "o.longitude AS origin_lng, "
+            "d.name AS destination_name, d.latitude AS destination_lat, "
+            "d.longitude AS destination_lng, "
+            "v.plate, v.vehicle_type "
+            "FROM assignments a "
+            "JOIN shipments s ON s.id = a.shipment_id "
+            "JOIN locations o ON o.id = s.origin_id "
+            "JOIN locations d ON d.id = s.destination_id "
+            "JOIN vehicles v ON v.id = a.vehicle_id "
+            "WHERE a.driver_id = %s AND a.ended_at IS NULL "
+            "ORDER BY a.started_at",
+            (driver_id,),
+        ).fetchall()
+    return {"driver": driver, "jobs": jobs}
+
+
+async def _save_delivery_proof(assignment_id, file: UploadFile | None):
+    """Store an optional proof photo; returns (path, sha256) or (None, None)."""
+    if file is None or not file.filename:
+        return None, None
+    content = await file.read()
+    if not content:
+        return None, None
+    if len(content) > MAX_EVIDENCE_BYTES:
+        raise HTTPException(status_code=413,
+                            detail="Photo is larger than 20 MB")
+    digest = hashlib.sha256(content).hexdigest()
+    ext = os.path.splitext(file.filename)[1][:10] or ".jpg"
+    path = os.path.join(EVIDENCE_DIR, f"delivery_{assignment_id}_{digest[:12]}{ext}")
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(content)
+    return path, digest
+
+
+@app.post("/driver/{driver_id}/jobs/{assignment_id}/deliver")
+async def deliver_job(driver_id: int, assignment_id: int,
+                      note: str = "", photo: UploadFile | None = None):
+    """The driver marks the job delivered. Photo proof is optional - never
+    mandatory, and never a condition for confirming a delivery."""
+    proof_path, proof_digest = await _save_delivery_proof(assignment_id, photo)
+    with get_connection() as conn:
+        job = conn.execute(
+            "SELECT a.id, a.shipment_id, a.ended_at, s.status AS shipment_status "
+            "FROM assignments a JOIN shipments s ON s.id = a.shipment_id "
+            "WHERE a.id = %s AND a.driver_id = %s",
+            (assignment_id, driver_id),
+        ).fetchone()
+        if job is None:
+            raise HTTPException(status_code=404,
+                                detail="No such job for this driver")
+        if job["ended_at"] is not None or \
+                job["shipment_status"] == "completed":
+            raise HTTPException(status_code=409,
+                                detail="This job is already delivered")
+        delivered_at = datetime.now(timezone.utc)
+        conn.execute(
+            "UPDATE shipments SET status = 'completed', delivered_at = %s "
+            "WHERE id = %s", (delivered_at, job["shipment_id"]))
+        conn.execute(
+            "UPDATE assignments SET ended_at = %s, delivered_at = %s, "
+            "delivery_note = %s, proof_path = %s, proof_sha256 = %s "
+            "WHERE id = %s",
+            (delivered_at, delivered_at, note or None, proof_path,
+             proof_digest, assignment_id))
+        event = emit(
+            conn, "assignment.completed", "info",
+            vehicle_id=None, shipment_id=job["shipment_id"],
+            details={"assignment_id": assignment_id, "driver_id": driver_id,
+                     "delivered_at": delivered_at.isoformat(),
+                     "proof": bool(proof_digest)},
+        )
+        append_audit(
+            conn, "driver", "delivery.confirmed", "allowed",
+            actor_id=str(driver_id),
+            entity_type="assignment", entity_id=str(assignment_id),
+            details={"shipment_id": job["shipment_id"],
+                     "note": note or None,
+                     "proof_sha256": proof_digest,
+                     "photo_optional": True},
+        )
+    await broadcast_event(event)
+    return {"assignment_id": assignment_id,
+            "shipment_id": job["shipment_id"],
+            "delivered_at": delivered_at.isoformat(),
+            "proof_recorded": bool(proof_digest)}
 
 
 @app.post("/incidents/{incident_id}/evidence")
