@@ -60,9 +60,10 @@ def test_jobs_lists_only_that_driver(client):
     assert client.get("/driver/424242/jobs").status_code == 404
 
 
-def test_deliver_completes_job_without_photo(client):
+def test_deliver_completes_job_without_photo(client, driver_login):
     driver_id, assignment_id, shipment_id = build_world(client)
-    result = client.post(
+    driver = driver_login(driver_id)
+    result = driver.post(
         f"/driver/{driver_id}/jobs/{assignment_id}/deliver",
         data={"note": "handed to storekeeper"})
     assert result.status_code == 200, result.text
@@ -88,10 +89,11 @@ def test_deliver_completes_job_without_photo(client):
     assert client.get("/audit/verify").json()["ok"] is True
 
 
-def test_deliver_with_photo_records_hash(client):
+def test_deliver_with_photo_records_hash(client, driver_login):
     driver_id, assignment_id, shipment_id = build_world(client)
+    driver = driver_login(driver_id)
     png = b"\x89PNG fake image bytes for hashing"
-    result = client.post(
+    result = driver.post(
         f"/driver/{driver_id}/jobs/{assignment_id}/deliver",
         data={"note": "proof attached"},
         files={"photo": (" doorstep.png", png, "image/png")})
@@ -110,21 +112,26 @@ def test_deliver_with_photo_records_hash(client):
     os.remove(os.path.join(EVIDENCE_DIR, stored[0]))  # leave no test litter
 
 
-def test_deliver_rejections(client):
+def test_deliver_rejections(client, driver_login):
     driver_id, assignment_id, _ = build_world(client)
-    # wrong driver
+    driver = driver_login(driver_id)
+    # console users may not deliver; a driver token is required
+    assert client.post(
+        f"/driver/{driver_id}/jobs/{assignment_id}/deliver"
+        ).status_code == 401
+    # wrong driver: stranger's token does not match the path
     stranger = client.post("/drivers", json={
         "full_name": "Stranger", "licence_number": "TN0820260999",
         "licence_type": "LMV", "licence_expiry": "2035-12-31",
         "phone": "+91 91234 90000"}).json()["id"]
-    assert client.post(
-        f"/driver/{stranger}/jobs/{assignment_id}/deliver").status_code == 404
-    assert client.post(
+    assert driver.post(
+        f"/driver/{stranger}/jobs/{assignment_id}/deliver").status_code == 401
+    assert driver.post(
         f"/driver/{driver_id}/jobs/987654/deliver").status_code == 404
     # double delivery
-    assert client.post(
+    assert driver.post(
         f"/driver/{driver_id}/jobs/{assignment_id}/deliver").status_code == 200
-    assert client.post(
+    assert driver.post(
         f"/driver/{driver_id}/jobs/{assignment_id}/deliver").status_code == 409
 
 

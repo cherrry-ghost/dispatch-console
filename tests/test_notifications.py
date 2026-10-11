@@ -42,16 +42,17 @@ def test_customer_contact_stored_with_shipment(client):
     assert shipment["customer_phone"] == "+91 90000 11111"
 
 
-def test_assignment_and_delivery_notify_customer(client):
+def test_assignment_and_delivery_notify_customer(client, driver_login):
     driver_id, assignment_id, shipment_id = build_world(client, customer={
         "name": "Asha Traders", "phone": "+91 90000 11111"})
+    driver = driver_login(driver_id)
 
     notes = client.get(f"/notifications?shipment_id={shipment_id}").json()
     assert [n["kind"] for n in notes] == ["assigned"]
     assert "on the way" in notes[0]["message"]
     assert notes[0]["recipient"] == "Asha Traders"
 
-    result = client.post(
+    result = driver.post(
         f"/driver/{driver_id}/jobs/{assignment_id}/deliver")
     assert result.status_code == 200, result.text
 
@@ -64,18 +65,18 @@ def test_assignment_and_delivery_notify_customer(client):
     assert {e["details"]["kind"] for e in events} >= {"assigned", "delivered"}
 
 
-def test_no_customer_contact_means_no_notification(client):
+def test_no_customer_contact_means_no_notification(client, driver_login):
     driver_id, assignment_id, shipment_id = build_world(client)  # no customer
-    result = client.post(
+    result = driver_login(driver_id).post(
         f"/driver/{driver_id}/jobs/{assignment_id}/deliver")
     assert result.status_code == 200  # delivery still works
     assert client.get("/notifications").json() == []
 
 
-def test_driver_incident_report_notifies_customer_and_audits(client):
+def test_driver_incident_report_notifies_customer_and_audits(client, driver_login):
     driver_id, assignment_id, shipment_id = build_world(client, customer={
         "name": "Asha Traders", "phone": "+91 90000 11111"})
-    result = client.post(
+    result = driver_login(driver_id).post(
         f"/driver/{driver_id}/jobs/{assignment_id}/incident", json={
             "description": "Tree fallen across the road near the bridge",
             "incident_type": "road_blocked"})
@@ -101,16 +102,21 @@ def test_driver_incident_report_notifies_customer_and_audits(client):
     assert client.get("/audit/verify").json()["ok"] is True
 
 
-def test_driver_incident_rejections(client):
+def test_driver_incident_rejections(client, driver_login):
     driver_id, assignment_id, _ = build_world(client)
+    driver = driver_login(driver_id)
     stranger = client.post("/drivers", json={
         "full_name": "X Driver", "licence_number": "TN0920260666",
         "licence_type": "LMV", "licence_expiry": "2035-12-31",
         "phone": "+91 90000 22222"}).json()["id"]
+    # token/path mismatch and missing driver
+    assert driver.post(f"/driver/{stranger}/jobs/{assignment_id}/incident",
+                       json={"description": "s", "incident_type": "other"}
+                       ).status_code == 401
     assert client.post(f"/driver/{stranger}/jobs/{assignment_id}/incident",
                        json={"description": "s", "incident_type": "other"}
-                       ).status_code == 404
-    empty = client.post(
+                       ).status_code == 401
+    empty = driver.post(
         f"/driver/{driver_id}/jobs/{assignment_id}/incident",
         json={"description": "   ", "incident_type": "other"})
     assert empty.status_code == 422
