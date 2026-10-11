@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from audit import append_audit, verify_chain
 import hashlib
@@ -16,6 +16,12 @@ from planner import plan_shipments
 from zones import split_edges_by_zones
 from validator import validate_route
 from datagen import generate_world
+from delay_model import (
+    FEATURES, MIN_HISTORY_FOR_TRAINING, MODEL_PATH, MODEL_VERSION,
+    load as load_model, mean_absolute_error as delay_model_mae,
+    model_exists, predict as predict_delay, route_features,
+    save as save_delay_model, train as train_delay_model, travel_minutes,
+)
 from typing import Literal
 from psycopg.types.json import Jsonb
 
@@ -170,7 +176,8 @@ def list_shipments():
     with get_connection() as conn:
         rows = conn.execute(
                         "SELECT id, description, weight_kg, is_hazardous, origin_id, "
-            "destination_id, required_vehicle_type, status, created_at "
+            "destination_id, required_vehicle_type, status, created_at, "
+            "delivered_at, eta_minutes, delay_minutes "
             "FROM shipments ORDER BY id"
         ).fetchall()
     return rows
@@ -1083,11 +1090,12 @@ class DatagenIn(BaseModel):
     confirm: bool = False  # required to add data when tables are not empty
 
 SCALES = {
-    "small": {"locations": 6, "vehicles": 4, "drivers": 4, "shipments": 8},
+    "small": {"locations": 6, "vehicles": 4, "drivers": 4, "shipments": 8,
+              "history": 20},
     "medium": {"locations": 12, "vehicles": 10, "drivers": 10,
-               "shipments": 30},
+               "shipments": 30, "history": 60},
     "large": {"locations": 16, "vehicles": 25, "drivers": 20,
-              "shipments": 80},
+              "shipments": 80, "history": 150},
 }
 
 
@@ -1112,7 +1120,7 @@ def run_datagen(body: DatagenIn):
                 )
         world = generate_world(
             body.seed, counts["locations"], counts["vehicles"],
-            counts["drivers"], counts["shipments"])
+            counts["drivers"], counts["shipments"], counts["history"])
 
         loc_ids = []
         for loc in world["locations"]:
@@ -1154,6 +1162,20 @@ def run_datagen(body: DatagenIn):
                  loc_ids[s["origin_id"]], loc_ids[s["destination_id"]],
                  s["required_vehicle_type"]),
             )
+        now = datetime.now(timezone.utc)
+        for h in world["history"]:
+            created = now - timedelta(minutes=h["created_minutes_ago"])
+            delivered = created + timedelta(
+                minutes=h["travel_minutes"] + h["delay_minutes"])
+            conn.execute(
+                "INSERT INTO shipments (description, weight_kg, "
+                "is_hazardous, origin_id, destination_id, status, created_at, "
+                "delivered_at, eta_minutes, delay_minutes) "
+                "VALUES (%s, %s, %s, %s, %s, 'completed', %s, %s, %s, %s)",
+                (h["description"], h["weight_kg"], h["is_hazardous"],
+                 loc_ids[h["origin_id"]], loc_ids[h["destination_id"]],
+                 created, delivered, h["eta_minutes"], h["delay_minutes"]),
+            )
         summary = {
             "scale": body.scale, "seed": body.seed,
             "locations": len(loc_ids),
@@ -1161,6 +1183,7 @@ def run_datagen(body: DatagenIn):
             "vehicles": len(world["vehicles"]),
             "drivers": len(world["drivers"]),
             "shipments": len(world["shipments"]),
+            "history": len(world["history"]),
         }
         append_audit(
             conn, "datagen", "datagen.run", "allowed",
@@ -1168,6 +1191,126 @@ def run_datagen(body: DatagenIn):
             details=summary,
         )
     return summary
+
+
+def _completed_samples(conn):
+    """Feature/target rows from completed shipment history."""
+    edges = conn.execute("SELECT * FROM road_edges").fetchall()
+    shipments = conn.execute(
+        "SELECT * FROM shipments WHERE status = 'completed' "
+        "AND delay_minutes IS NOT NULL ORDER BY id"
+    ).fetchall()
+    samples = []
+    for s in shipments:
+        route = shortest_route(edges, s["origin_id"], s["destination_id"])
+        if route is None:
+            continue  # network changed since this shipment ran
+        sample = route_features(route, s)
+        sample["delay_minutes"] = s["delay_minutes"]
+        samples.append(sample)
+    return samples
+
+
+class TrainIn(BaseModel):
+    holdout_fraction: float = Field(default=0.2, gt=0.0, lt=0.5)
+
+
+@app.post("/model/train")
+def train_model(body: TrainIn):
+    from random import Random
+    with get_connection() as conn:
+        samples = _completed_samples(conn)
+    if len(samples) < MIN_HISTORY_FOR_TRAINING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Not enough completed history: have {len(samples)}, "
+                   f"need {MIN_HISTORY_FOR_TRAINING}. Generate data with "
+                   "POST /datagen first.",
+        )
+    rng = Random(0)
+    rng.shuffle(samples)
+    holdout_n = max(1, int(len(samples) * body.holdout_fraction))
+    holdout, train_set = samples[:holdout_n], samples[holdout_n:]
+    model = train_delay_model(train_set)
+    mae = delay_model_mae(model, holdout)
+    save_delay_model(model)
+    append_row = append_audit  # alias to keep the with-block short
+    with get_connection() as conn:
+        append_row(
+            conn, "ai_delay_model", "model.trained", "allowed",
+            entity_type="model", entity_id=str(MODEL_VERSION),
+            details={"samples": len(train_set),
+                     "holdout_samples": len(holdout),
+                     "mae_minutes_holdout": mae,
+                     "model": "xgboost", "model_version": MODEL_VERSION,
+                     "features": FEATURES},
+        )
+    return {"samples": len(train_set), "holdout_samples": len(holdout),
+            "mae_minutes_holdout": mae, "model": "xgboost",
+            "model_version": MODEL_VERSION, "features": FEATURES}
+
+
+class PredictIn(BaseModel):
+    shipment_id: int
+
+
+@app.post("/predict/eta")
+def predict_eta(body: PredictIn):
+    # The model only proposes: nothing is written to the shipment.
+    with get_connection() as conn:
+        shipment = conn.execute(
+            "SELECT * FROM shipments WHERE id = %s", (body.shipment_id,)
+        ).fetchone()
+        if shipment is None:
+            raise HTTPException(status_code=404, detail="Shipment not found")
+        edges = conn.execute("SELECT * FROM road_edges").fetchall()
+    route = shortest_route(edges, shipment["origin_id"],
+                           shipment["destination_id"])
+    if route is None:
+        with get_connection() as conn:
+            append_audit(
+                conn, "ai_delay_model", "eta.predicted", "blocked",
+                entity_type="shipment", entity_id=str(body.shipment_id),
+                details={"reason": "no open route between origin and "
+                                   "destination"},
+            )
+        raise HTTPException(
+            status_code=404,
+            detail="No open route between this shipment's origin and "
+                   "destination, so no ETA is possible.",
+        )
+    if not model_exists():
+        raise HTTPException(
+            status_code=409,
+            detail="Delay model is not trained yet. POST /model/train first.",
+        )
+    features = route_features(route, shipment)
+    model = load_model()
+    delay_pred = round(predict_delay(model, features), 1)
+    travel = travel_minutes(features)
+    eta = travel + round(delay_pred)
+    with get_connection() as conn:
+        append_audit(
+            conn, "ai_delay_model", "eta.predicted", "allowed",
+            entity_type="shipment", entity_id=str(body.shipment_id),
+            details={"input_snapshot": {"shipment_id": body.shipment_id,
+                                        "weight_kg": shipment["weight_kg"],
+                                        "is_hazardous":
+                                        shipment["is_hazardous"],
+                                        "status": shipment["status"]},
+                     "route": {"path": route["path"],
+                               "distance_km": route["distance_km"],
+                               "max_risk": route["max_risk"]},
+                     "features": features,
+                     "predicted_delay_minutes": delay_pred,
+                     "travel_minutes": travel, "eta_minutes": eta,
+                     "model": "xgboost", "model_version": MODEL_VERSION},
+        )
+    return {"shipment_id": body.shipment_id, "eta_minutes": eta,
+            "travel_minutes": travel,
+            "predicted_delay_minutes": delay_pred,
+            "features_used": features,
+            "model": {"name": "xgboost", "version": MODEL_VERSION}}
 
 
 class PlannerRequest(BaseModel):

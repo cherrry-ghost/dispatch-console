@@ -24,10 +24,12 @@ def build_graph(edges, risk_weight=0.0):
 
 def _path_summary(g, path):
     legs = [g[a][b] for a, b in zip(path, path[1:])]
+    risks = [leg["risk_score"] for leg in legs]
     return {
         "path": path,
         "distance_km": round(sum(leg["distance_km"] for leg in legs), 2),
-        "max_risk": max((leg["risk_score"] for leg in legs), default=0),
+        "max_risk": max(risks, default=0),
+        "avg_risk": round(sum(risks) / len(risks), 1) if risks else 0.0,
         "weighted_cost": round(sum(leg["weight"] for leg in legs), 2),
     }
 

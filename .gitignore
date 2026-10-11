@@ -5,3 +5,4 @@ dispatch.db
 append_audit.txt
 *:Zone.Identifier
 evidence/
+models/
