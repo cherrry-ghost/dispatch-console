@@ -46,8 +46,9 @@ def make_shipment(client, weight=2000):
         json={
             "name": "Warehouse",
             "location_type": "warehouse",
-            "latitude": 11.0168,
-            "longitude": 76.9558,
+            # close to the depot: two loads must fit into one working day
+            "latitude": 13.15,
+            "longitude": 80.35,
         },
     ).json()["id"]
     response = client.post(

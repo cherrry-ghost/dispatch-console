@@ -39,6 +39,8 @@ class VehicleIn(BaseModel):
     capacity_kg: int
     insurance_expiry: date | None = None
     fitness_expiry: date | None = None
+    home_depot_id: int | None = None
+    speed_kmh: int | None = Field(default=None, ge=5, le=120)
 
 
 def get_connection():
@@ -59,8 +61,8 @@ def health():
 def list_vehicles():
     with get_connection() as conn:
         rows = conn.execute(
-                        "SELECT id, plate, vehicle_type, capacity_kg, insurance_expiry, "
-            "fitness_expiry FROM vehicles ORDER BY id"
+            "SELECT id, plate, vehicle_type, capacity_kg, insurance_expiry, "
+            "fitness_expiry, home_depot_id, speed_kmh FROM vehicles ORDER BY id"
         ).fetchall()
     return rows
 
@@ -71,14 +73,17 @@ def create_vehicle(vehicle: VehicleIn):
         with get_connection() as conn:
             row = conn.execute(
                 "INSERT INTO vehicles "
-                "(plate, vehicle_type, capacity_kg, insurance_expiry, fitness_expiry) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                "(plate, vehicle_type, capacity_kg, insurance_expiry, "
+                "fitness_expiry, home_depot_id, speed_kmh) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     vehicle.plate,
                     vehicle.vehicle_type,
                     vehicle.capacity_kg,
                     vehicle.insurance_expiry,
                     vehicle.fitness_expiry,
+                    vehicle.home_depot_id,
+                    vehicle.speed_kmh if vehicle.speed_kmh is not None else 40,
                 ),
             ).fetchone()
             append_audit(
@@ -135,13 +140,14 @@ class LocationIn(BaseModel):
     location_type: str
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
+    is_depot: bool = False
 
 
 @app.get("/locations")
 def list_locations():
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, name, location_type, latitude, longitude "
+            "SELECT id, name, location_type, latitude, longitude, is_depot "
             "FROM locations ORDER BY id"
         ).fetchall()
     return rows
@@ -151,13 +157,14 @@ def list_locations():
 def create_location(location: LocationIn):
     with get_connection() as conn:
         row = conn.execute(
-            "INSERT INTO locations (name, location_type, latitude, longitude) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO locations (name, location_type, latitude, longitude, "
+            "is_depot) VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (
                 location.name,
                 location.location_type,
                 location.latitude,
                 location.longitude,
+                location.is_depot,
             ),
         ).fetchone()
     return {"id": row["id"], **location.model_dump()}
@@ -169,15 +176,18 @@ class ShipmentIn(BaseModel):
     origin_id: int
     destination_id: int
     required_vehicle_type: str | None = None
+    ready_minute: int = Field(default=0, ge=0, le=1440)
+    deadline_minute: int | None = Field(default=None, ge=1, le=1440)
 
 
 @app.get("/shipments")
 def list_shipments():
     with get_connection() as conn:
         rows = conn.execute(
-                        "SELECT id, description, weight_kg, is_hazardous, origin_id, "
+            "SELECT id, description, weight_kg, is_hazardous, origin_id, "
             "destination_id, required_vehicle_type, status, created_at, "
-            "delivered_at, eta_minutes, delay_minutes "
+            "delivered_at, eta_minutes, delay_minutes, "
+            "ready_minute, deadline_minute "
             "FROM shipments ORDER BY id"
         ).fetchall()
     return rows
@@ -189,13 +199,20 @@ def create_shipment(shipment: ShipmentIn):
         raise HTTPException(
             status_code=400, detail="Origin and destination must be different"
         )
+    if (shipment.deadline_minute is not None
+            and shipment.deadline_minute <= shipment.ready_minute):
+        raise HTTPException(
+            status_code=400,
+            detail="deadline_minute must be later than ready_minute",
+        )
     try:
         with get_connection() as conn:
             row = conn.execute(
-                                "INSERT INTO shipments "
+                "INSERT INTO shipments "
                 "(description, weight_kg, is_hazardous, origin_id, destination_id, "
-                "required_vehicle_type) "
-                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, status, created_at",
+                "required_vehicle_type, ready_minute, deadline_minute) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id, status, created_at",
                 (
                     shipment.description,
                     shipment.weight_kg,
@@ -203,6 +220,8 @@ def create_shipment(shipment: ShipmentIn):
                     shipment.origin_id,
                     shipment.destination_id,
                     shipment.required_vehicle_type,
+                    shipment.ready_minute,
+                    shipment.deadline_minute,
                 ),
             ).fetchone()
     except psycopg.errors.ForeignKeyViolation:
@@ -1126,9 +1145,9 @@ def run_datagen(body: DatagenIn):
         for loc in world["locations"]:
             row = conn.execute(
                 "INSERT INTO locations (name, location_type, latitude, "
-                "longitude) VALUES (%s, %s, %s, %s) RETURNING id",
+                "longitude, is_depot) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                 (loc["name"], loc["location_type"], loc["latitude"],
-                 loc["longitude"]),
+                 loc["longitude"], loc["is_depot"]),
             ).fetchone()
             loc_ids.append(row["id"])
         for road in world["roads"]:
@@ -1141,10 +1160,11 @@ def run_datagen(body: DatagenIn):
         for v in world["vehicles"]:
             conn.execute(
                 "INSERT INTO vehicles (plate, vehicle_type, capacity_kg, "
-                "insurance_expiry, fitness_expiry) "
-                "VALUES (%s, %s, %s, %s, %s)",
+                "insurance_expiry, fitness_expiry, home_depot_id, speed_kmh) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (v["plate"], v["vehicle_type"], v["capacity_kg"],
-                 v["insurance_expiry"], v["fitness_expiry"]),
+                 v["insurance_expiry"], v["fitness_expiry"],
+                 loc_ids[v["home_depot"]], v["speed_kmh"]),
             )
         for d in world["drivers"]:
             conn.execute(
@@ -1157,10 +1177,12 @@ def run_datagen(body: DatagenIn):
             conn.execute(
                 "INSERT INTO shipments (description, weight_kg, "
                 "is_hazardous, origin_id, destination_id, "
-                "required_vehicle_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                "required_vehicle_type, ready_minute, deadline_minute) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (s["description"], s["weight_kg"], s["is_hazardous"],
                  loc_ids[s["origin_id"]], loc_ids[s["destination_id"]],
-                 s["required_vehicle_type"]),
+                 s["required_vehicle_type"], s["ready_minute"],
+                 s["deadline_minute"]),
             )
         now = datetime.now(timezone.utc)
         for h in world["history"]:
@@ -1323,6 +1345,14 @@ def propose_plan(body: PlannerRequest):
         vehicles = conn.execute(
             "SELECT * FROM vehicles ORDER BY id"
         ).fetchall()
+        locations = conn.execute(
+            "SELECT id, latitude, longitude, is_depot FROM locations "
+            "ORDER BY id"
+        ).fetchall()
+        edges = conn.execute(
+            "SELECT from_location_id, to_location_id, distance_km, status "
+            "FROM road_edges"
+        ).fetchall()
         if body.shipment_ids is None:
             shipments = conn.execute(
                 "SELECT * FROM shipments WHERE status = 'pending' ORDER BY id"
@@ -1333,7 +1363,8 @@ def propose_plan(body: PlannerRequest):
                 "AND id = ANY(%s) ORDER BY id",
                 (body.shipment_ids,),
             ).fetchall()
-        plan = plan_shipments(shipments, vehicles, date.today())
+        plan = plan_shipments(shipments, vehicles, date.today(),
+                              edges=edges, locations=locations)
         run_id = uuid4().hex[:12]
         # The planner is an AI actor: the input snapshot, the recommendation
         # and the skips are recorded before a human decides anything.
@@ -1341,7 +1372,8 @@ def propose_plan(body: PlannerRequest):
             conn, "ai_planner", "plan.propose", "allowed",
             entity_type="plan", entity_id=run_id,
             details={
-                "model": "ortools-cp-sat", "model_version": 1,
+                "model": "ortools-cp-sat", "model_version": 2,
+                "travel_model": plan["travel_model"],
                 "input": {
                     "shipment_ids": [s["id"] for s in shipments],
                     "vehicle_ids": [v["id"] for v in vehicles],

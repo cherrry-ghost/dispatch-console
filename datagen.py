@@ -27,6 +27,7 @@ LAST_NAMES = ["Kumar", "Raj", "Selvam", "Krishnan", "Subramani", "Palani",
               "Murthy", "Chettiar", "Pillai", "Nadar"]
 
 VEHICLE_TYPES = ["truck", "lorry", "van", "container"]
+SPEED_BY_TYPE = {"truck": 36, "lorry": 32, "van": 46, "container": 30}
 CARGO = ["Rice bags", "Steel rods", "Cotton bales", "Electronics",
          "Spare parts", "Textiles", "Sugar sacks", "Cement bags",
          "Furniture", "Packaged food", "Auto components", "Fertiliser"]
@@ -54,6 +55,7 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
     rng = Random(seed)
 
     cities = rng.sample(CITIES, min(n_locations, len(CITIES)))
+    n_depots = max(1, min(3, n_locations))
     locations = []
     extra = n_locations - len(cities)
     branch_towns = ["Branch {:02d}".format(i + 1) for i in range(extra)]
@@ -69,6 +71,7 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
             "name": city_name,
             "location_type": ("city" if i < len(cities) else "branch_depot"),
             "latitude": lat, "longitude": lng,
+            "is_depot": i < n_depots,
         })
 
     # Road network: minimum spanning tree by distance keeps it connected,
@@ -128,14 +131,17 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
     vehicles = []
     for _ in range(n_vehicles):
         expiry_year = rng.randint(2024, 2038)
+        vtype = rng.choice(VEHICLE_TYPES)
         vehicles.append({
             "plate": _plate(rng, used_plates),
-            "vehicle_type": rng.choice(VEHICLE_TYPES),
+            "vehicle_type": vtype,
             "capacity_kg": rng.choice([1500, 3500, 5000, 7500, 9000, 16000]),
             "insurance_expiry": "{}-{:02d}-{:02d}".format(
                 expiry_year, rng.randint(1, 12), rng.randint(1, 28)),
             "fitness_expiry": "{}-{:02d}-{:02d}".format(
                 rng.randint(2024, 2038), rng.randint(1, 12), rng.randint(1, 28)),
+            "home_depot": rng.randrange(n_depots),
+            "speed_kmh": SPEED_BY_TYPE[vtype] + rng.randint(-2, 2),
         })
 
     drivers = []
@@ -144,12 +150,30 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
                               rng.choice(LAST_NAMES))
         drivers.append({
             "full_name": name,
-            "licence_number": "TN{:02d}20{:02d}{:05d}".format(
-                rng.randint(1, 12), rng.randint(10, 25), i + 1),
+            # the seed keeps licence numbers unique across appended worlds
+            "licence_number": "TN{:02d}20{:02d}{:05d}-{:04d}".format(
+                rng.randint(1, 12), rng.randint(10, 25), i + 1, seed % 10000),
             "licence_expiry": "{}-{:02d}-{:02d}".format(
                 rng.randint(2024, 2036), rng.randint(1, 12), rng.randint(1, 28)),
             "hazmat_certified": rng.random() < 0.3,
         })
+
+    # Shortest-road distances power both shipment time windows and history.
+    import networkx as nx
+    road_graph = nx.Graph()
+    for road in roads:
+        if road["status"] == "open":
+            road_graph.add_edge(road["from"], road["to"],
+                                distance_km=road["distance_km"],
+                                risk_score=road["risk_score"])
+
+    def shortest_km(a, b):
+        try:
+            length = nx.shortest_path_length(
+                road_graph, a, b, weight="distance_km")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+        return length
 
     shipments = []
     for i in range(n_shipments):
@@ -160,6 +184,16 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
         else:
             cargo = rng.choice(CARGO)
             hazardous = False
+        # Time windows: ready when the goods are packed, deadline a realistic
+        # drive later. Estimated at the slowest fleet speed so any vehicle
+        # type could make it; about a quarter of loads stay deadline-free.
+        ready = rng.choice([0, 0, 30, 60, 120, 240])
+        deadline = None
+        if rng.random() >= 0.25:
+            km = shortest_km(origin, dest)
+            if km is not None:
+                estimate = km * 60 / 30  # slowest fleet speed
+                deadline = min(1440, ready + int(estimate) + rng.randint(60, 300))
         shipments.append({
             "description": cargo,
             "weight_kg": rng.randint(100, 9000),
@@ -168,29 +202,25 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
             "destination_id": dest,
             "required_vehicle_type": (rng.choice(VEHICLE_TYPES)
                                       if rng.random() < 0.3 else None),
+            "ready_minute": ready,
+            "deadline_minute": deadline,
         })
 
     # Completed history for the delay model: shipments that "already ran"
     # weeks ago, with the true delay planted by synthetic_truth().
     history = []
     if n_history:
-        import networkx as nx
         truth_rng = Random(seed + 777)
-        g = nx.Graph()
-        for road in roads:
-            if road["status"] == "open":
-                g.add_edge(road["from"], road["to"],
-                           distance_km=road["distance_km"],
-                           risk_score=road["risk_score"])
         tries = 0
         while len(history) < n_history and tries < n_history * 10:
             tries += 1
             origin, dest = rng.sample(range(n), 2)
             try:
-                path = nx.shortest_path(g, origin, dest, weight="distance_km")
+                path = nx.shortest_path(
+                    road_graph, origin, dest, weight="distance_km")
             except nx.NetworkXNoPath:
                 continue
-            legs = [g[a][b] for a, b in zip(path, path[1:])]
+            legs = [road_graph[a][b] for a, b in zip(path, path[1:])]
             route = {
                 "path": path,
                 "distance_km": round(sum(l["distance_km"] for l in legs), 2),

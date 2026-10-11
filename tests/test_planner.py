@@ -15,7 +15,7 @@ def make_shipment_with(client, weight, required=None):
     destination = client.post(
         "/locations",
         json={"name": "Warehouse", "location_type": "warehouse",
-              "latitude": 11.0168, "longitude": 76.9558},
+              "latitude": 13.15, "longitude": 80.35},
     ).json()["id"]
     return client.post(
         "/shipments",
@@ -192,3 +192,133 @@ def test_empty_fleet_returns_empty_plan(client):
     assert data["proposals"] == []
     assert data["summary"]["shipments_planned"] == 0
     assert data["skipped"][0]["shipment_id"] == s
+
+
+# ---- Phase 5C: time windows, depots, mixed fleet --------------------
+
+def make_world(client, roads):
+    """Locations with a depot, joined by the given (a, b, km, status) roads."""
+    depot = client.post("/locations", json={
+        "name": "Central Depot", "location_type": "depot",
+        "latitude": 11.0, "longitude": 78.0, "is_depot": True}).json()["id"]
+    mid = client.post("/locations", json={
+        "name": "Midtown", "location_type": "city",
+        "latitude": 11.3, "longitude": 78.2}).json()["id"]
+    far = client.post("/locations", json={
+        "name": "Farville", "location_type": "city",
+        "latitude": 11.6, "longitude": 78.4}).json()["id"]
+    towns = {"depot": depot, "mid": mid, "far": far}
+    for a, b, km, status in roads:
+        client.post("/road-edges", json={
+            "from_location_id": towns[a], "to_location_id": towns[b],
+            "distance_km": km, "status": status})
+    return towns
+
+
+def make_fleet_vehicle(client, plate, speed=None, depot=None, vtype="truck"):
+    body = {"plate": plate, "vehicle_type": vtype, "capacity_kg": 5000,
+            "insurance_expiry": "2035-12-31", "fitness_expiry": "2035-12-31"}
+    if speed:
+        body["speed_kmh"] = speed
+    if depot:
+        body["home_depot_id"] = depot
+    return client.post("/vehicles", json=body).json()["id"]
+
+
+def window_shipment(client, origin, dest, ready=0, deadline=None, weight=1000):
+    body = {"description": "Timed goods", "weight_kg": weight,
+            "origin_id": origin, "destination_id": dest,
+            "ready_minute": ready}
+    if deadline is not None:
+        body["deadline_minute"] = deadline
+    return client.post("/shipments", json=body).json()["id"]
+
+
+def test_deadline_nobody_can_make_is_skipped(client):
+    towns = make_world(client, [("depot", "mid", 100, "open"),
+                                ("mid", "far", 100, "open")])
+    make_fleet_vehicle(client, "TN51AA0001", speed=40, depot=towns["depot"])
+    s = window_shipment(client, towns["depot"], towns["far"], deadline=60)
+
+    data = propose(client).json()
+
+    assert data["proposals"] == []
+    assert "time windows" in data["skipped"][0]["reason"]
+
+
+def test_fast_vehicle_makes_the_deadline_slow_one_does_not(client):
+    towns = make_world(client, [("depot", "far", 100, "open")])
+    slow = make_fleet_vehicle(client, "TN52AA0002", speed=20,
+                              depot=towns["depot"])
+    fast = make_fleet_vehicle(client, "TN52BB0003", speed=60,
+                              depot=towns["depot"], vtype="van")
+    s = window_shipment(client, towns["depot"], towns["far"], deadline=150)
+
+    data = propose(client).json()
+
+    assert [p["vehicle_id"] for p in data["proposals"]] == [fast]
+    assert slow != fast
+
+
+def test_vehicle_waits_for_the_ready_time(client):
+    towns = make_world(client, [("depot", "far", 100, "open")])
+    make_fleet_vehicle(client, "TN53AA0004", speed=60, depot=towns["depot"])
+    s = window_shipment(client, towns["depot"], towns["far"],
+                        ready=600, deadline=900)
+
+    data = propose(client).json()
+
+    assert data["summary"]["shipments_planned"] == 1
+    p = data["proposals"][0]
+    assert p["pickup_minute"] >= 600
+    assert p["drop_minute"] <= 900
+
+
+def test_stops_come_back_in_route_order(client):
+    towns = make_world(client, [("depot", "mid", 60, "open"),
+                                ("mid", "far", 80, "open")])
+    vehicle = make_fleet_vehicle(client, "TN54AA0005", speed=40,
+                                 depot=towns["depot"])
+    s1 = window_shipment(client, towns["depot"], towns["mid"])
+    s2 = window_shipment(client, towns["mid"], towns["far"])
+
+    data = propose(client).json()
+
+    assert data["summary"]["shipments_planned"] == 2
+    assert data["summary"]["vehicles_used"] == 1
+    stops = data["vehicles"][0]["stops"]
+    assert [st["shipment_id"] for st in stops] == [s1, s2]
+    assert stops[0]["drop_minute"] <= stops[1]["pickup_minute"] + 1
+    assert data["vehicles"][0]["home_depot_id"] == towns["depot"]
+
+
+def test_closed_road_makes_shipment_unreachable(client):
+    towns = make_world(client, [("depot", "mid", 50, "open"),
+                                ("mid", "far", 50, "closed")])
+    make_fleet_vehicle(client, "TN55AA0006", speed=40, depot=towns["depot"])
+    ok_s = window_shipment(client, towns["depot"], towns["mid"])
+    stuck = window_shipment(client, towns["mid"], towns["far"])
+
+    data = propose(client).json()
+
+    ids = {p["shipment_id"] for p in data["proposals"]}
+    assert ids == {ok_s}
+    reason = next(r["reason"] for r in data["skipped"]
+                  if r["shipment_id"] == stuck)
+    assert "No open road" in reason
+
+
+def test_shipment_window_validation(client):
+    origin = client.post("/locations", json={
+        "name": "A", "location_type": "depot",
+        "latitude": 11.0, "longitude": 78.0, "is_depot": True}).json()["id"]
+    dest = client.post("/locations", json={
+        "name": "B", "location_type": "warehouse",
+        "latitude": 11.1, "longitude": 78.1}).json()["id"]
+    response = client.post("/shipments", json={
+        "description": "Bad window", "weight_kg": 100,
+        "origin_id": origin, "destination_id": dest,
+        "ready_minute": 500, "deadline_minute": 400})
+
+    assert response.status_code == 400
+    assert "deadline" in response.json()["detail"]
