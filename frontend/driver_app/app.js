@@ -236,7 +236,8 @@ function render(data, driverId) {
   });
 }
 
-$("load").addEventListener("click", loadJobs);
+const loadBtn = $("load");
+if (loadBtn) loadBtn.addEventListener("click", loadJobs);
 loadJobs();
 
 
