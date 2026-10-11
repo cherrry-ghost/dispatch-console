@@ -12,6 +12,7 @@ import AssignmentForm from "./AssignmentForm";
 import ApprovalsPanel from "./ApprovalsPanel";
 import CopilotPanel from "./CopilotPanel";
 import EventsFeed from "./EventsFeed";
+import LoginBar from "./LoginBar";
 import LiveVehicles from "./LiveVehicles";
 import NotificationsPanel from "./NotificationsPanel";
 
@@ -61,6 +62,7 @@ function App() {
   return (
     <div style={{ width: "min(950px, 95vw)", textAlign: "left" }}>
       <h1>Dispatch Console</h1>
+      <LoginBar />
       {error && <p>Could not load data: {error}</p>}
 
       <CopilotPanel />

@@ -26,7 +26,7 @@ def actions(client, prefix):
             if r["action"].startswith(prefix)]
 
 
-def test_report_incident_is_audited(client):
+def test_report_incident_is_audited(client, manager_client):
     edge = make_road(client)
     r = make_incident(client, road_edge_id=edge)
 
@@ -37,15 +37,15 @@ def test_report_incident_is_audited(client):
     assert logged[0]["details"]["road_edge_id"] == edge
 
 
-def test_report_unknown_road_is_400(client):
+def test_report_unknown_road_is_400(client, manager_client):
     assert make_incident(client, road_edge_id=999).status_code == 400
 
 
-def test_verify_closes_the_road_and_is_audited(client):
+def test_verify_closes_the_road_and_is_audited(client, manager_client):
     edge = make_road(client)
     incident_id = make_incident(client, road_edge_id=edge).json()["id"]
 
-    r = client.post(f"/incidents/{incident_id}/verify")
+    r = manager_client.post(f"/incidents/{incident_id}/verify")
 
     assert r.status_code == 200
     assert r.json()["road_closed"] is True
@@ -55,10 +55,10 @@ def test_verify_closes_the_road_and_is_audited(client):
     assert logged[0]["details"]["road_closed"] is True
 
 
-def test_resolve_reopens_the_road(client):
+def test_resolve_reopens_the_road(client, manager_client):
     edge = make_road(client)
     incident_id = make_incident(client, road_edge_id=edge).json()["id"]
-    client.post(f"/incidents/{incident_id}/verify")
+    manager_client.post(f"/incidents/{incident_id}/verify")
 
     r = client.post(f"/incidents/{incident_id}/resolve")
 
@@ -67,41 +67,41 @@ def test_resolve_reopens_the_road(client):
     assert client.get("/road-edges").json()[0]["status"] == "open"
 
 
-def test_lifecycle_cannot_skip_states(client):
+def test_lifecycle_cannot_skip_states(client, manager_client):
     edge = make_road(client)
     incident_id = make_incident(client, road_edge_id=edge).json()["id"]
 
     # resolve straight from reported is illegal
     assert client.post(f"/incidents/{incident_id}/resolve").status_code == 409
-    assert client.post(f"/incidents/{incident_id}/verify").status_code == 200
+    assert manager_client.post(f"/incidents/{incident_id}/verify").status_code == 200
     # verify twice is illegal
-    assert client.post(f"/incidents/{incident_id}/verify").status_code == 409
+    assert manager_client.post(f"/incidents/{incident_id}/verify").status_code == 409
 
 
-def test_dismiss_keeps_road_open_and_blocks_later_verify(client):
+def test_dismiss_keeps_road_open_and_blocks_later_verify(client, manager_client):
     edge = make_road(client)
     incident_id = make_incident(client, road_edge_id=edge).json()["id"]
 
-    r = client.post(f"/incidents/{incident_id}/dismiss")
+    r = manager_client.post(f"/incidents/{incident_id}/dismiss")
 
     assert r.status_code == 200
     assert client.get("/road-edges").json()[0]["status"] == "open"
-    assert client.post(f"/incidents/{incident_id}/verify").status_code == 409
+    assert manager_client.post(f"/incidents/{incident_id}/verify").status_code == 409
 
 
-def test_verify_without_road_works(client):
+def test_verify_without_road_works(client, manager_client):
     incident_id = make_incident(client).json()["id"]
-    r = client.post(f"/incidents/{incident_id}/verify")
+    r = manager_client.post(f"/incidents/{incident_id}/verify")
     assert r.status_code == 200
     assert r.json()["road_closed"] is False
 
 
-def test_evidence_is_optional_and_hash_is_audited(client):
+def test_evidence_is_optional_and_hash_is_audited(client, manager_client):
     edge = make_road(client)
     incident_id = make_incident(client, road_edge_id=edge).json()["id"]
 
     # verify and resolve with NO evidence attached at all
-    assert client.post(f"/incidents/{incident_id}/verify").status_code == 200
+    assert manager_client.post(f"/incidents/{incident_id}/verify").status_code == 200
     assert client.post(f"/incidents/{incident_id}/resolve").status_code == 200
     assert client.get(f"/incidents/{incident_id}").json()["evidence"] == []
 
@@ -132,9 +132,9 @@ def test_evidence_is_optional_and_hash_is_audited(client):
         assert verify_chain(conn)["ok"] is True
 
 
-def test_evidence_rejected_after_dismissed(client):
+def test_evidence_rejected_after_dismissed(client, manager_client):
     incident_id = make_incident(client).json()["id"]
-    client.post(f"/incidents/{incident_id}/dismiss")
+    manager_client.post(f"/incidents/{incident_id}/dismiss")
     r = client.post(
         f"/incidents/{incident_id}/evidence",
         files={"file": ("late.jpg", b"bytes", "image/jpeg")},
@@ -153,7 +153,7 @@ def test_evidence_too_large_is_rejected(client, monkeypatch):
     assert MAX_EVIDENCE_BYTES >= 20 * 1024 * 1024  # real limit untouched
 
 
-def test_manual_road_status_endpoint(client):
+def test_manual_road_status_endpoint(client, manager_client):
     edge = make_road(client)
     r = client.post(f"/road-edges/{edge}/status", json={"status": "closed"})
     assert r.status_code == 200

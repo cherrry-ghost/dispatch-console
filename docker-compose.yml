@@ -1,0 +1,58 @@
+version: "3.9"
+
+# One command to run the whole system: `docker compose up --build`
+# Postgres on 5432, API on 8010 (serves the driver app at /driver-app),
+# console UI on 8080. Migrations run automatically before the API starts.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dispatch
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dispatch"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: python migrate.py
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/dispatch
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: sh -c "python wait_db.py && exec uvicorn main:app --host 0.0.0.0 --port 8010"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/dispatch
+      DISPATCH_SECRET: change-me-in-production
+    ports:
+      - "8010:8010"
+    volumes:
+      - evidence:/app/evidence
+      - models:/app/models
+    depends_on:
+      - migrate
+
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  evidence:
+  models:

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from psycopg.rows import tuple_row
 from psycopg.types.json import Jsonb
+from security import current_actor
 
 GENESIS_HASH = "0" * 64  # "previous hash" for the very first row
 
@@ -25,6 +26,9 @@ def compute_hash(prev_hash, created_at, actor_type, actor_id, action,
 def append_audit(conn, actor_type, action, outcome, actor_id=None,
                  entity_type=None, entity_id=None, details=None):
     details = details or {}
+    # the authenticated username fills in actor_id automatically for any
+    # endpoint that does not name its actor explicitly
+    actor_id = actor_id if actor_id is not None else current_actor.get()
     # Turn dates etc. into plain JSON so the hash matches what the DB stores.
     details = json.loads(json.dumps(details, default=str))
     conn.execute("LOCK TABLE audit_log IN EXCLUSIVE MODE")

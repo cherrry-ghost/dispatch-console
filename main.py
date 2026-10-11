@@ -8,11 +8,12 @@ import os
 
 import networkx as nx
 import psycopg
-from fastapi import FastAPI, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 from guardrails import evaluate, is_allowed, route_label
+import security
 from routing import shortest_route, ranked_routes
 from planner import plan_shipments
 from zones import split_edges_by_zones
@@ -51,6 +52,162 @@ DRIVER_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 if os.path.isdir(DRIVER_APP_DIR):
     app.mount("/driver-app", StaticFiles(directory=DRIVER_APP_DIR, html=True),
               name="driver-app")
+
+# ------------------------------------------------------------- security
+
+async def current_user(
+        authorization: str | None = Header(default=None)) -> dict:
+    user = security.token_from_header(authorization)
+    if user is None:
+        raise HTTPException(status_code=401,
+                            detail="Login required (Bearer token missing "
+                                   "or invalid)")
+    # async on purpose: the contextvar must be set in the request's own
+    # context so sync endpoints (threadpool) inherit the actor identity
+    security.current_actor.set(user["username"])
+    return user
+
+
+def require_roles(*roles):
+    """Allow the listed roles; 'admin' always passes."""
+    async def dep(user: dict = Depends(current_user)) -> dict:
+        if user["role"] != "admin" and user["role"] not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This action needs role: {' or '.join(roles)}")
+        return user
+    return dep
+
+
+async def require_driver(
+        driver_id: int,
+        authorization: str | None = Header(default=None)) -> dict:
+    user = security.token_from_header(authorization)
+    if (user is None or user["role"] != "driver"
+            or user["driver_id"] != driver_id):
+        raise HTTPException(status_code=401,
+                            detail="Driver login required for this driver")
+    security.current_actor.set(f"driver:{driver_id}")
+    return user
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/login")
+def login(body: LoginIn):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = %s",
+                           (body.username,)).fetchone()
+    if row is None or not security.verify_secret(body.password,
+                                                 row["password_hash"]):
+        raise HTTPException(status_code=401,
+                            detail="Wrong username or password")
+    return {"token": security.make_token(row["username"], row["role"]),
+            "username": row["username"], "role": row["role"]}
+
+
+class DriverLoginIn(BaseModel):
+    driver_id: int
+    pin: str
+
+
+@app.post("/driver/login")
+def driver_login(body: DriverLoginIn):
+    with get_connection() as conn:
+        row = conn.execute("SELECT id, full_name, pin_hash FROM drivers "
+                           "WHERE id = %s", (body.driver_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    if row["pin_hash"] is None:
+        ok = body.pin == "1234"  # default PIN until changed
+    else:
+        ok = security.verify_secret(body.pin, row["pin_hash"])
+    if not ok:
+        raise HTTPException(status_code=401, detail="Wrong driver PIN")
+    return {"token": security.make_token(f"driver:{body.driver_id}",
+                                         "driver", body.driver_id),
+            "driver_id": body.driver_id, "full_name": row["full_name"]}
+
+# --------------------------------------------------------- observability
+
+_metrics_state = {"requests": 0, "errors": 0, "total_ms": 0.0}
+
+
+@app.middleware("http")
+async def observe_requests(request, call_next):
+    started = __import__("time").perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _metrics_state["requests"] += 1
+        _metrics_state["errors"] += 1
+        raise
+    elapsed_ms = (__import__("time").perf_counter() - started) * 1000
+    _metrics_state["requests"] += 1
+    _metrics_state["total_ms"] += elapsed_ms
+    if response.status_code >= 500:
+        _metrics_state["errors"] += 1
+    print(f"{request.method} {request.url.path} -> {response.status_code} "
+          f"{elapsed_ms:.1f}ms", flush=True)
+    return response
+
+
+@app.get("/health")
+def health():
+    """Liveness + readiness: database, model files, road network."""
+    checks = {"api": "ok"}
+    try:
+        with get_connection() as conn:
+            conn.execute("SELECT 1")
+            checks["database"] = "ok"
+            checks["pending_shipments"] = conn.execute(
+                "SELECT count(*) AS n FROM shipments "
+                "WHERE status = 'pending'").fetchone()["n"]
+            checks["open_roads"] = conn.execute(
+                "SELECT count(*) AS n FROM road_edges "
+                "WHERE status = 'open'").fetchone()["n"]
+            checks["vehicles"] = conn.execute(
+                "SELECT count(*) AS n FROM vehicles").fetchone()["n"]
+    except Exception as exc:
+        checks["database"] = f"error: {exc}"
+        raise HTTPException(status_code=503, detail=checks)
+    checks["delay_model"] = ("trained" if model_exists() else "untrained")
+    checks["status"] = "ok"
+    return checks
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus text format: app counters plus database gauges."""
+    lines = [
+        "# TYPE dispatch_requests_total counter",
+        f"dispatch_requests_total {_metrics_state['requests']}",
+        "# TYPE dispatch_errors_total counter",
+        f"dispatch_errors_total {_metrics_state['errors']}",
+        "# TYPE dispatch_latency_ms_avg gauge",
+        f"dispatch_latency_ms_avg {round(_metrics_state['total_ms'] / _metrics_state['requests'], 2) if _metrics_state['requests'] else 0}",
+    ]
+    try:
+        with get_connection() as conn:
+            for name, query in [
+                ("shipments_pending",
+                 "SELECT count(*) AS n FROM shipments WHERE status='pending'"),
+                ("shipments_total", "SELECT count(*) AS n FROM shipments"),
+                ("assignments_active",
+                 "SELECT count(*) AS n FROM assignments WHERE ended_at IS NULL"),
+                ("audit_entries", "SELECT count(*) AS n FROM audit_log"),
+                ("events_total", "SELECT count(*) AS n FROM events"),
+                ("notifications_total",
+                 "SELECT count(*) AS n FROM notifications"),
+            ]:
+                lines += [f"# TYPE dispatch_{name} gauge",
+                          f"dispatch_{name} {conn.execute(query).fetchone()['n']}"]
+    except Exception:
+        lines += ["# database gauges unavailable"]
+    return "\n".join(lines) + "\n"
 
 class LiveManager:
     """Tracks console viewers on /ws/live and pushes new positions to them."""
@@ -133,7 +290,8 @@ class VehiclePositionIn(BaseModel):
 
 
 @app.post("/vehicles/{vehicle_id}/position")
-async def report_position(vehicle_id: int, body: VehiclePositionIn):
+async def report_position(vehicle_id: int, body: VehiclePositionIn,
+                          user: dict = Depends(require_roles("dispatcher"))):
     alert = await _ingest_position(vehicle_id, body.latitude, body.longitude,
                                    body.speed_kmh, body.source)
     return {"vehicle_id": vehicle_id, "zone_alert": alert,
@@ -278,7 +436,8 @@ class CopilotAskIn(BaseModel):
 
 
 @app.post("/copilot/ask")
-def copilot_ask(body: CopilotAskIn):
+def copilot_ask(body: CopilotAskIn,
+                 user: dict = Depends(require_roles("dispatcher"))):
     """Ask the copilot. Informational intents answer directly; ACTION
     intents become stored proposals - the copilot never executes."""
     with get_connection() as conn:
@@ -334,7 +493,8 @@ class CopilotDecisionIn(BaseModel):
 
 
 @app.post("/copilot/proposals/{proposal_id}/decision")
-async def copilot_decide(proposal_id: int, body: CopilotDecisionIn):
+async def copilot_decide(proposal_id: int, body: CopilotDecisionIn,
+                          user: dict = Depends(require_roles("dispatcher"))):
     """The human moment: accept runs the proposal through the SAME
     guardrailed endpoints as a manual action - nothing is bypassed."""
     with get_connection() as conn:
@@ -361,13 +521,13 @@ async def copilot_decide(proposal_id: int, body: CopilotDecisionIn):
                 vehicle_id=payload["vehicle_id"],
                 driver_id=payload["driver_id"],
                 reason=payload.get("reason") or "copilot proposal"),
-                response)
+                response, user)
             result = {"executed": True, "assignment": created}
         elif payload["action"] == "road_status":
             result = {"executed": True,
                       "road": await set_road_status(
                           payload["edge_id"],
-                          RoadStatusIn(status=payload["status"]))}
+                          RoadStatusIn(status=payload["status"]), user)}
         elif payload["action"] == "zone":
             result = {"executed": True,
                       "zone": create_zone(ZoneIn(
@@ -375,7 +535,7 @@ async def copilot_decide(proposal_id: int, body: CopilotDecisionIn):
                           center_lat=payload["center_lat"],
                           center_lng=payload["center_lng"],
                           radius_km=payload["radius_km"],
-                          zone_type=payload["zone_type"]))}
+                          zone_type=payload["zone_type"]), user)}
         else:
             outcome, result = "blocked", {"error": "unknown action"}
     except HTTPException as exc:
@@ -444,7 +604,8 @@ def list_vehicles():
 
 
 @app.post("/vehicles")
-def create_vehicle(vehicle: VehicleIn):
+def create_vehicle(vehicle: VehicleIn,
+                   user: dict = Depends(require_roles("dispatcher"))):
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -478,6 +639,7 @@ class DriverIn(BaseModel):
     licence_number: str
     licence_expiry: date
     hazmat_certified: bool = False
+    pin: str = "1234"  # default PIN, should be changed after first login
 
 
 @app.get("/drivers")
@@ -491,18 +653,20 @@ def list_drivers():
 
 
 @app.post("/drivers")
-def create_driver(driver: DriverIn):
+def create_driver(driver: DriverIn,
+                  user: dict = Depends(require_roles("dispatcher"))):
     try:
         with get_connection() as conn:
             row = conn.execute(
                 "INSERT INTO drivers "
-                "(full_name, licence_number, licence_expiry, hazmat_certified) "
-                "VALUES (%s, %s, %s, %s) RETURNING id",
+                "(full_name, licence_number, licence_expiry, hazmat_certified, "
+                "pin_hash) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                 (
                     driver.full_name,
                     driver.licence_number,
                     driver.licence_expiry,
                     driver.hazmat_certified,
+                    security.hash_secret(driver.pin),
                 ),
             ).fetchone()
     except psycopg.errors.UniqueViolation:
@@ -530,7 +694,8 @@ def list_locations():
 
 
 @app.post("/locations")
-def create_location(location: LocationIn):
+def create_location(location: LocationIn,
+                    user: dict = Depends(require_roles("dispatcher"))):
     with get_connection() as conn:
         row = conn.execute(
             "INSERT INTO locations (name, location_type, latitude, longitude, "
@@ -572,7 +737,8 @@ def list_shipments():
 
 
 @app.post("/shipments")
-def create_shipment(shipment: ShipmentIn):
+def create_shipment(shipment: ShipmentIn,
+                      user: dict = Depends(require_roles("dispatcher"))):
     if shipment.origin_id == shipment.destination_id:
         raise HTTPException(
             status_code=400, detail="Origin and destination must be different"
@@ -660,7 +826,8 @@ def load_entities(conn, req):
 
 
 @app.post("/assignments")
-async def create_assignment(assignment: AssignmentIn, response: Response):
+async def create_assignment(assignment: AssignmentIn, response: Response,
+                          user: dict = Depends(require_roles("dispatcher"))):
     req = assignment.model_dump()
     with get_connection() as conn:
         vehicle, driver, shipment = load_entities(conn, req)
@@ -765,7 +932,8 @@ class DecisionIn(BaseModel):
 
 
 @app.post("/approvals/{approval_id}/decision")
-def decide_approval(approval_id: int, body: DecisionIn):
+def decide_approval(approval_id: int, body: DecisionIn,
+                    user: dict = Depends(require_roles("manager"))):
     blocked = None
     with get_connection() as conn:
         ap = conn.execute(
@@ -891,7 +1059,8 @@ def list_road_edges():
 
 
 @app.post("/road-edges")
-def create_road_edge(edge: RoadEdgeIn):
+def create_road_edge(edge: RoadEdgeIn,
+                     user: dict = Depends(require_roles("dispatcher"))):
     if edge.from_location_id == edge.to_location_id:
         raise HTTPException(
             status_code=400, detail="A road must connect two different locations"
@@ -935,7 +1104,8 @@ class ZoneIn(BaseModel):
 
 
 @app.post("/zones")
-def create_zone(zone: ZoneIn):
+def create_zone(zone: ZoneIn,
+                  user: dict = Depends(require_roles("dispatcher"))):
     with get_connection() as conn:
         row = conn.execute(
             "INSERT INTO zones (name, center_lat, center_lng, radius_km, "
@@ -965,7 +1135,8 @@ class ZoneStatusIn(BaseModel):
 
 
 @app.post("/zones/{zone_id}/status")
-def set_zone_status(zone_id: int, body: ZoneStatusIn):
+def set_zone_status(zone_id: int, body: ZoneStatusIn,
+                          user: dict = Depends(require_roles("dispatcher"))):
     with get_connection() as conn:
         row = conn.execute(
             "UPDATE zones SET active = %s WHERE id = %s RETURNING id, name",
@@ -987,7 +1158,8 @@ class RoadStatusIn(BaseModel):
 
 
 @app.post("/road-edges/{edge_id}/status")
-async def set_road_status(edge_id: int, body: RoadStatusIn):
+async def set_road_status(edge_id: int, body: RoadStatusIn,
+                          user: dict = Depends(require_roles("dispatcher"))):
     with get_connection() as conn:
         row = conn.execute(
             "UPDATE road_edges SET status = %s WHERE id = %s "
@@ -1022,7 +1194,8 @@ class IncidentIn(BaseModel):
 
 
 @app.post("/incidents")
-def report_incident(incident: IncidentIn):
+def report_incident(incident: IncidentIn,
+                     user: dict = Depends(require_roles("dispatcher"))):
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -1079,7 +1252,8 @@ def _set_road_for_incident(conn, road_edge_id, closed):
 
 
 @app.post("/incidents/{incident_id}/verify")
-def verify_incident(incident_id: int):
+def verify_incident(incident_id: int,
+                    user: dict = Depends(require_roles("manager"))):
     with get_connection() as conn:
         inc = _load_incident(conn, incident_id)
         if inc["status"] != "reported":
@@ -1110,7 +1284,8 @@ def verify_incident(incident_id: int):
 
 
 @app.post("/incidents/{incident_id}/dismiss")
-def dismiss_incident(incident_id: int):
+def dismiss_incident(incident_id: int,
+                     user: dict = Depends(require_roles("manager"))):
     with get_connection() as conn:
         inc = _load_incident(conn, incident_id)
         if inc["status"] != "reported":
@@ -1131,7 +1306,8 @@ def dismiss_incident(incident_id: int):
 
 
 @app.post("/incidents/{incident_id}/resolve")
-def resolve_incident(incident_id: int):
+def resolve_incident(incident_id: int,
+                     user: dict = Depends(require_roles("dispatcher"))):
     with get_connection() as conn:
         inc = _load_incident(conn, incident_id)
         if inc["status"] != "verified":
@@ -1219,7 +1395,8 @@ async def _save_delivery_proof(assignment_id, file: UploadFile | None):
 
 @app.post("/driver/{driver_id}/jobs/{assignment_id}/incident")
 async def driver_report_incident(driver_id: int, assignment_id: int,
-                                 body: IncidentIn):
+                                 body: IncidentIn,
+                                 user: dict = Depends(require_driver)):
     """A driver reports a road problem on an active job. The customer of
     that shipment is told immediately (plain words, no blame)."""
     if not body.description.strip():
@@ -1264,7 +1441,8 @@ async def driver_report_incident(driver_id: int, assignment_id: int,
 
 @app.post("/driver/{driver_id}/jobs/{assignment_id}/deliver")
 async def deliver_job(driver_id: int, assignment_id: int,
-                      note: str = "", photo: UploadFile | None = None):
+                      note: str = "", photo: UploadFile | None = None,
+                      user: dict = Depends(require_driver)):
     """The driver marks the job delivered. Photo proof is optional - never
     mandatory, and never a condition for confirming a delivery."""
     proof_path, proof_digest = await _save_delivery_proof(assignment_id, photo)
@@ -1319,7 +1497,8 @@ async def deliver_job(driver_id: int, assignment_id: int,
 
 
 @app.post("/incidents/{incident_id}/evidence")
-async def attach_evidence(incident_id: int, file: UploadFile):
+async def attach_evidence(incident_id: int, file: UploadFile,
+                          user: dict = Depends(require_roles("dispatcher"))):
     content = await file.read()
     if len(content) > MAX_EVIDENCE_BYTES:
         raise HTTPException(status_code=413, detail="File is larger than 20 MB")
@@ -1505,7 +1684,8 @@ def list_routes(from_id: int, to_id: int):
 
 
 @app.post("/route/use-request")
-def request_route_use(body: RouteUseIn, response: Response):
+def request_route_use(body: RouteUseIn, response: Response,
+                      user: dict = Depends(require_roles("dispatcher"))):
     """Ask to USE a route. High-risk (orange) routes need manager approval."""
     risk_weight = 1.0 if body.prefer == "safe" else 0.0
     result, blocked_names = _validated_route(
@@ -1697,7 +1877,8 @@ def _run_scenario(actions):
 
 
 @app.post("/simulate/disruption")
-def simulate_disruption(scenario: SimulateIn):
+def simulate_disruption(scenario: SimulateIn,
+                        user: dict = Depends(require_roles("dispatcher"))):
     result = _run_scenario([scenario])
     with get_connection() as conn:
         append_audit(
@@ -1715,7 +1896,8 @@ class ScenarioIn(BaseModel):
 
 
 @app.post("/simulate/scenario")
-def simulate_scenario(body: ScenarioIn):
+def simulate_scenario(body: ScenarioIn,
+                      user: dict = Depends(require_roles("dispatcher"))):
     result = _run_scenario(body.actions)
     with get_connection() as conn:
         append_audit(
@@ -1745,7 +1927,8 @@ def list_playbooks():
 
 
 @app.post("/playbooks")
-def create_playbook(body: PlaybookIn):
+def create_playbook(body: PlaybookIn,
+                    user: dict = Depends(require_roles("dispatcher"))):
     # a playbook may only be saved after its scenario passed a simulation
     result = _run_scenario(body.actions)
     try:
@@ -1784,7 +1967,8 @@ def _load_playbook(conn, playbook_id):
 
 
 @app.post("/playbooks/{playbook_id}/test")
-def test_playbook(playbook_id: int):
+def test_playbook(playbook_id: int,
+                  user: dict = Depends(require_roles("dispatcher"))):
     """Re-run the stored scenario so the recorded impact stays honest."""
     with get_connection() as conn:
         row = _load_playbook(conn, playbook_id)
@@ -1807,7 +1991,8 @@ def test_playbook(playbook_id: int):
 
 
 @app.post("/playbooks/{playbook_id}/apply")
-def apply_playbook(playbook_id: int):
+def apply_playbook(playbook_id: int,
+                   user: dict = Depends(require_roles("dispatcher"))):
     """Apply the pre-approved response for real: close roads, add zones,
     raise risks. Idempotent - already-done steps are noted, not repeated."""
     with get_connection() as conn:
@@ -1878,7 +2063,8 @@ SCALES = {
 
 
 @app.post("/datagen")
-def run_datagen(body: DatagenIn):
+def run_datagen(body: DatagenIn,
+                user: dict = Depends(require_roles("admin", "dispatcher"))):
     """Fill the database with a synthetic world for demos and exploration.
 
     Guard: refuses to mix synthetic rows into a database that already has
@@ -1925,12 +2111,14 @@ def run_datagen(body: DatagenIn):
                  v["insurance_expiry"], v["fitness_expiry"],
                  loc_ids[v["home_depot"]], v["speed_kmh"]),
             )
+        driver_pin_hash = security.hash_secret("1234")  # default driver PIN
         for d in world["drivers"]:
             conn.execute(
                 "INSERT INTO drivers (full_name, licence_number, "
-                "licence_expiry, hazmat_certified) VALUES (%s, %s, %s, %s)",
+                "licence_expiry, hazmat_certified, pin_hash) "
+                "VALUES (%s, %s, %s, %s, %s)",
                 (d["full_name"], d["licence_number"], d["licence_expiry"],
-                 d["hazmat_certified"]),
+                 d["hazmat_certified"], driver_pin_hash),
             )
         for s in world["shipments"]:
             conn.execute(
@@ -1997,7 +2185,8 @@ class TrainIn(BaseModel):
 
 
 @app.post("/model/train")
-def train_model(body: TrainIn):
+def train_model(body: TrainIn,
+                user: dict = Depends(require_roles("admin", "dispatcher"))):
     from random import Random
     with get_connection() as conn:
         samples = _completed_samples(conn)
@@ -2040,7 +2229,8 @@ class PredictIn(BaseModel):
 
 
 @app.post("/predict/eta")
-def predict_eta(body: PredictIn):
+def predict_eta(body: PredictIn,
+                user: dict = Depends(require_roles("dispatcher"))):
     # The model only proposes: nothing is written to the shipment.
     with get_connection() as conn:
         shipment = conn.execute(
@@ -2241,7 +2431,8 @@ def list_anomalies():
 class PlannerRequest(BaseModel):
     shipment_ids: list[int] | None = None  # None = all pending shipments
 @app.post("/planner/propose")
-def propose_plan(body: PlannerRequest):
+def propose_plan(body: PlannerRequest,
+                 user: dict = Depends(require_roles("dispatcher"))):
     with get_connection() as conn:
         vehicles = conn.execute(
             "SELECT * FROM vehicles ORDER BY id"

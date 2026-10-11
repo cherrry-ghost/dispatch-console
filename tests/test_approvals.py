@@ -18,14 +18,14 @@ def actions(client):
     return [r["action"] for r in client.get("/audit?limit=50").json()]
 
 
-def test_clean_assignment_is_immediate(client):
+def test_clean_assignment_is_immediate(client, manager_client):
     req = setup_world(client, weight=2000)
     response = client.post("/assignments", json=req)
     assert response.status_code == 200
     assert client.get("/approvals").json() == []
 
 
-def test_warning_goes_to_pending_approval(client):
+def test_warning_goes_to_pending_approval(client, manager_client):
     req = setup_world(client, weight=4800)  # 96% of 5000 kg -> near_capacity warn
     response = client.post("/assignments", json=req)
     assert response.status_code == 202
@@ -37,10 +37,10 @@ def test_warning_goes_to_pending_approval(client):
     assert "assignment.request_approval" in actions(client)
 
 
-def test_approve_applies_assignment(client):
+def test_approve_applies_assignment(client, manager_client):
     req = setup_world(client, weight=4800)
     approval_id = client.post("/assignments", json=req).json()["approval_id"]
-    response = client.post(
+    response = manager_client.post(
         f"/approvals/{approval_id}/decision",
         json={"decision": "approved", "note": "ok"},
     )
@@ -53,10 +53,10 @@ def test_approve_applies_assignment(client):
         assert verify_chain(conn)["ok"] is True
 
 
-def test_reject_does_not_apply(client):
+def test_reject_does_not_apply(client, manager_client):
     req = setup_world(client, weight=4800)
     approval_id = client.post("/assignments", json=req).json()["approval_id"]
-    response = client.post(
+    response = manager_client.post(
         f"/approvals/{approval_id}/decision",
         json={"decision": "rejected", "note": "too risky"},
     )
@@ -66,20 +66,20 @@ def test_reject_does_not_apply(client):
     assert "approval.rejected" in actions(client)
 
 
-def test_cannot_decide_twice(client):
+def test_cannot_decide_twice(client, manager_client):
     req = setup_world(client, weight=4800)
     approval_id = client.post("/assignments", json=req).json()["approval_id"]
     body = {"decision": "approved", "note": ""}
-    assert client.post(f"/approvals/{approval_id}/decision", json=body).status_code == 200
-    assert client.post(f"/approvals/{approval_id}/decision", json=body).status_code == 409
+    assert manager_client.post(f"/approvals/{approval_id}/decision", json=body).status_code == 200
+    assert manager_client.post(f"/approvals/{approval_id}/decision", json=body).status_code == 409
 
 
-def test_unknown_approval_is_404(client):
+def test_unknown_approval_is_404(client, manager_client):
     body = {"decision": "approved", "note": ""}
-    assert client.post("/approvals/999/decision", json=body).status_code == 404
+    assert manager_client.post("/approvals/999/decision", json=body).status_code == 404
 
 
-def test_hard_block_is_never_sent_to_approval(client):
+def test_hard_block_is_never_sent_to_approval(client, manager_client):
     req = setup_world(client, weight=9000)  # over capacity -> block
     response = client.post("/assignments", json=req)
     assert response.status_code == 422

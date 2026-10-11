@@ -22,7 +22,7 @@ def risky_world(client):
     return a, b, c
 
 
-def test_fast_route_takes_shortcut_and_flags_approval(client):
+def test_fast_route_takes_shortcut_and_flags_approval(client, manager_client):
     a, b, c = risky_world(client)
     r = client.get(f"/route?from_id={a}&to_id={b}").json()
     assert r["path"] == [a, b]
@@ -30,7 +30,7 @@ def test_fast_route_takes_shortcut_and_flags_approval(client):
     assert r["label"] == "needs_approval"
 
 
-def test_safe_route_takes_the_long_clean_way(client):
+def test_safe_route_takes_the_long_clean_way(client, manager_client):
     a, b, c = risky_world(client)
     r = client.get(f"/route?from_id={a}&to_id={b}&prefer=safe").json()
     assert r["path"] == [a, c, b]
@@ -39,7 +39,7 @@ def test_safe_route_takes_the_long_clean_way(client):
     assert r["label"] == "safe"
 
 
-def test_ranked_routes_lists_both_options(client):
+def test_ranked_routes_lists_both_options(client, manager_client):
     a, b, c = risky_world(client)
     r = client.get(f"/routes?from_id={a}&to_id={b}").json()
     assert len(r["routes"]) == 2
@@ -52,7 +52,7 @@ def test_ranked_routes_lists_both_options(client):
     assert r["routes"][1]["label"] == "needs_approval"
 
 
-def test_use_request_on_safe_route_needs_no_approval(client):
+def test_use_request_on_safe_route_needs_no_approval(client, manager_client):
     a, b, c = risky_world(client)
     r = client.post("/route/use-request",
                     json={"from_id": a, "to_id": b, "prefer": "safe"})
@@ -61,7 +61,7 @@ def test_use_request_on_safe_route_needs_no_approval(client):
     assert client.get("/approvals").json() == []
 
 
-def test_use_request_on_high_risk_route_goes_to_manager(client):
+def test_use_request_on_high_risk_route_goes_to_manager(client, manager_client):
     a, b, c = risky_world(client)
     r = client.post("/route/use-request",
                     json={"from_id": a, "to_id": b, "prefer": "fast"})
@@ -75,14 +75,14 @@ def test_use_request_on_high_risk_route_goes_to_manager(client):
     assert logged and logged[0]["outcome"] == "pending"
 
 
-def test_manager_can_approve_route_use(client):
+def test_manager_can_approve_route_use(client, manager_client):
     a, b, c = risky_world(client)
     approval_id = client.post(
         "/route/use-request",
         json={"from_id": a, "to_id": b, "prefer": "fast"},
     ).json()["approval_id"]
 
-    r = client.post(f"/approvals/{approval_id}/decision",
+    r = manager_client.post(f"/approvals/{approval_id}/decision",
                     json={"decision": "approved", "note": "escort ready"})
 
     assert r.status_code == 200
@@ -94,19 +94,19 @@ def test_manager_can_approve_route_use(client):
     assert logged[0]["entity_type"] == "route"
 
 
-def test_manager_can_reject_route_use(client):
+def test_manager_can_reject_route_use(client, manager_client):
     a, b, c = risky_world(client)
     approval_id = client.post(
         "/route/use-request",
         json={"from_id": a, "to_id": b, "prefer": "fast"},
     ).json()["approval_id"]
-    r = client.post(f"/approvals/{approval_id}/decision",
+    r = manager_client.post(f"/approvals/{approval_id}/decision",
                     json={"decision": "rejected", "note": "too risky"})
     assert r.status_code == 200
     assert client.get("/approvals").json()[0]["status"] == "rejected"
 
 
-def test_approval_blocked_when_route_later_becomes_unusable(client):
+def test_approval_blocked_when_route_later_becomes_unusable(client, manager_client):
     a, b, c = risky_world(client)
     edge_id = client.get("/road-edges").json()[0]["id"]  # the risky A-B road
     approval_id = client.post(
@@ -118,9 +118,9 @@ def test_approval_blocked_when_route_later_becomes_unusable(client):
     client.post("/incidents", json={
         "description": "Protest", "incident_type": "protest",
         "road_edge_id": edge_id})
-    client.post(f"/incidents/1/verify")
+    manager_client.post(f"/incidents/1/verify")
 
-    r = client.post(f"/approvals/{approval_id}/decision",
+    r = manager_client.post(f"/approvals/{approval_id}/decision",
                     json={"decision": "approved", "note": ""})
 
     assert r.status_code == 422

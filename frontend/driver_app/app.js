@@ -3,6 +3,14 @@
 // automatically when the connection returns.
 const QUEUE_KEY = "driver_pending_deliveries";
 const JOBS_KEY = "driver_last_jobs";
+const TOKEN_KEY = "driver_token";
+
+function token() { return localStorage.getItem(TOKEN_KEY); }
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (token()) headers["Authorization"] = `Bearer ${token()}`;
+  return headers;
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -38,7 +46,7 @@ async function deliver(job, note, photoFile) {
   if (photoFile) form.append("photo", photoFile);
   const res = await fetch(
     `/driver/${job.driver_id}/jobs/${job.assignment_id}/deliver`,
-    { method: "POST", body: form });
+    { method: "POST", body: form, headers: authHeaders() });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -76,7 +84,7 @@ async function flushQueue() {
       }
       const res = await fetch(
         `/driver/${entry.driver_id}/jobs/${entry.assignment_id}/deliver`,
-        { method: "POST", body: form });
+        { method: "POST", body: form, headers: authHeaders() });
       if (!res.ok) remaining.push(entry);  // 409 etc: keep and retry later
     } catch {
       remaining.push(entry);               // still offline
@@ -157,7 +165,7 @@ function render(data, driverId) {
       try {
         const res = await fetch(
           `/driver/${driverId}/jobs/${id}/incident`,
-          { method: "POST", headers: {"Content-Type": "application/json"},
+          { method: "POST", headers: authHeaders({"Content-Type": "application/json"}),
             body: JSON.stringify({ description: note, incident_type: kind }) });
         if (!res.ok) throw new Error(await res.text());
         box.innerHTML = `<span class="reported">✔ Report sent — the office and the customer are informed.</span>`;
@@ -197,3 +205,29 @@ function render(data, driverId) {
 
 $("load").addEventListener("click", loadJobs);
 loadJobs();
+
+
+// ---- sign in with driver id + PIN -------------------------------
+$("login").addEventListener("click", async () => {
+  const driverId = Number($("driverId").value);
+  const pin = $("pin").value.trim();
+  $("loginMsg").textContent = "";
+  try {
+    const res = await fetch("/driver/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ driver_id: driverId, pin }) });
+    const body = await res.json();
+    if (!res.ok) { $("loginMsg").textContent = body.detail || "Sign-in failed"; return; }
+    localStorage.setItem(TOKEN_KEY, body.token);
+    $("loginBox").style.display = "none";
+    loadJobs();
+  } catch (err) {
+    $("loginMsg").textContent = "Could not reach the server: " + err.message;
+  }
+});
+
+// already signed in? skip the login box
+if (token()) {
+  $("loginBox").style.display = "none";
+  loadJobs();
+}

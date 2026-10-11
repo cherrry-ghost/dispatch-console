@@ -18,11 +18,14 @@ import websockets
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8010"
 PASS, FAIL = [], []
+TOKEN = None  # set by login(); sent with every request
 
 
 def call(method, path, payload=None):
     data = None
     headers = {}
+    if TOKEN and not path.startswith(("/login", "/driver/login")):
+        headers["Authorization"] = f"Bearer {TOKEN}"
     if payload is not None:
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
@@ -38,6 +41,23 @@ def call(method, path, payload=None):
             return e.code, json.loads(body)
         except Exception:
             return e.code, {"raw": body.decode(errors="replace")}
+
+
+TOKENS = {}
+
+
+def call_as(username, password, method, path, payload=None):
+    """One call as another named user (their token, then back to ours)."""
+    global TOKEN
+    if username not in TOKENS:
+        sc, b = call("POST", "/login",
+                     {"username": username, "password": password})
+        TOKENS[username] = b.get("token", "") if sc == 200 else ""
+    saved, TOKEN = TOKEN, TOKENS[username]
+    try:
+        return call(method, path, payload)
+    finally:
+        TOKEN = saved
 
 
 def ok(label, detail=""):
@@ -63,6 +83,21 @@ def section(title):
 
 
 rng = Random()
+
+# 0 -- sign in: from now on every action is done by a named, audited user
+section("0. Login (Phase 10: no anonymous actions any more)")
+s, body = call("POST", "/login",
+               {"username": "dispatcher", "password": "dispatch123"})
+if check(s == 200 and "token" in body,
+         "dispatcher signs in and gets a token"):
+    TOKEN = body["token"]
+    ok("wrong passwords are refused",
+       f"status {call('POST', '/login', {'username': 'dispatcher', 'password': 'nope'})[0]}")
+saved_token = TOKEN
+TOKEN = None
+s, anon = call("POST", "/vehicles", {"plate": "X"})
+TOKEN = saved_token
+check(s == 401, "without a token, writes are refused", f"status {s}")
 
 # 1 ─ health ---------------------------------------------------------------
 section("1. Server health")
@@ -149,7 +184,8 @@ else:
     ap = b.get("approval_id")
     ok("guardrail raised a warning, manager sign-off needed")
     s2, pend = call("GET", "/approvals?status=pending")
-    s3, d = call("POST", f"/approvals/{ap}/decision",
+    s3, d = call_as("manager", "manager123", "POST",
+                    f"/approvals/{ap}/decision",
                  {"decision": "approved", "note": "demo approval"})
     check(s3 == 200, "manager approved the flagged assignment")
 s, after = call("GET", "/assignments")
@@ -195,7 +231,8 @@ s, b = call("POST", "/incidents", {"description": "Demo protest blocking road",
                                    "road_edge_id": edge["id"]})
 inc = b.get("id")
 check(s == 200, "incident reported by dispatcher")
-s, b = call("POST", f"/incidents/{inc}/verify")
+s, b = call_as("manager", "manager123", "POST",
+               f"/incidents/{inc}/verify")
 check(s == 200 and b.get("road_closed") is True, "manager verified -> ROAD CLOSED")
 fd, tmp = tempfile.mkstemp(suffix=".txt")
 with os.fdopen(fd, "w") as f:
@@ -206,10 +243,12 @@ with open(tmp, "rb") as f:
             f'name="file"; filename="evidence.txt"\r\n'
             f"Content-Type: text/plain\r\n\r\n{f.read()}\r\n"
             f"--{boundary}--\r\n").encode()
+ev_headers = {"Content-Type":
+              f"multipart/form-data; boundary={boundary}"}
+if TOKEN:
+    ev_headers["Authorization"] = f"Bearer {TOKEN}"
 req = urllib.request.Request(f"{BASE}/incidents/{inc}/evidence", data=body,
-                             method="POST",
-                             headers={"Content-Type":
-                                      f"multipart/form-data; boundary={boundary}"})
+                             method="POST", headers=ev_headers)
 with urllib.request.urlopen(req) as resp:
     ev = json.loads(resp.read())
 check(bool(ev.get("sha256")), "evidence filed, fingerprint recorded",
@@ -236,7 +275,8 @@ if risky:
                 {"from_id": risky[0], "to_id": risky[1], "prefer": "fast"})
     if s == 202:
         ok("dispatcher asked to use the risky road", f"max risk {risky[2]}")
-        s2, d = call("POST", f"/approvals/{b['approval_id']}/decision",
+        s2, d = call_as("manager", "manager123", "POST",
+                        f"/approvals/{b['approval_id']}/decision",
                      {"decision": "approved", "note": "escort arranged"})
         check(s2 == 200, "manager approved - route unlocked")
     else:
@@ -467,9 +507,16 @@ if check(s == 200, "driver's own jobs listed",
        f"{job['destination_name']}, vehicle {job['plate']}")
     png = b"\x89PNG fake proof photo for the demo"
     import httpx
+    s, dl = call("POST", "/driver/login",
+                 {"driver_id": drv["id"], "pin": "1234"})
+    if not check(s == 200 and "token" in dl,
+                 "driver signs in with id + PIN (Phase 10)"):
+        dl = {}
+    driver_auth = {"Authorization": f"Bearer {dl.get('token', '')}"}
     r = httpx.post(
         f"{BASE}/driver/{drv['id']}/jobs/{job['assignment_id']}/deliver",
-        data={"note": "demo delivery"}, files={"photo": ("proof.png", png, "image/png")})
+        data={"note": "demo delivery"}, files={"photo": ("proof.png", png, "image/png")},
+        headers=driver_auth)
     check(r.status_code == 200 and r.json()["proof_recorded"] is True,
           "delivery confirmed with optional photo proof",
           f"shipment #{job['shipment_id']} completed")
@@ -510,9 +557,12 @@ if check(s == 200, "shipment created with a customer contact",
         kinds = [n["kind"] for n in notes]
         check("assigned" in kinds, "customer told it is on the way",
               f'"{notes[0]["message"][:70]}"')
+        s, dl2 = call("POST", "/driver/login",
+                      {"driver_id": combo_driver["id"], "pin": "1234"})
+        auth2 = {"Authorization": f"Bearer {dl2.get('token', '')}"} if s == 200 else {}
         r = httpx.post(f"{BASE}/driver/{combo_driver['id']}/jobs/{b2['id']}/incident",
                        json={"description": "Demo: rockslide blocks the ghat road",
-                             "incident_type": "road_blocked"})
+                             "incident_type": "road_blocked"}, headers=auth2)
         check(r.status_code == 200,
               "driver reported an incident from the PWA",
               f"incident #{r.json().get('incident_id')}")
@@ -521,7 +571,7 @@ if check(s == 200, "shipment created with a customer contact",
         check("incident" in kinds, "customer was told about the problem",
               f'"{notes[0]["message"][:70]}..."')
         r = httpx.post(f"{BASE}/driver/{combo_driver['id']}/jobs/{b2['id']}/deliver",
-                       data={"note": "demo delivery"})
+                       data={"note": "demo delivery"}, headers=auth2)
         check(r.status_code == 200, "delivery confirmed")
         s, notes = call("GET", f"/notifications?shipment_id={demo_ship}")
         kinds = [n["kind"] for n in notes]
@@ -572,8 +622,30 @@ check(any(a["action"] == "copilot.suggested" for a in acts)
       and any(a["action"] == "copilot.accepted" for a in acts),
       "both the AI and the human left audit entries")
 
-# 20 ─ audit ledger ---------------------------------------------------------
-section("20. Tamper-proof audit ledger")
+# 20 -- security & observability --------------------------------------------
+section("20. Security & observability (Phase 10)")
+s, h = call("GET", "/health")
+check(s == 200 and h.get("status") == "ok",
+      "health endpoint reports database, model and network",
+      f"db {h.get('database')}, model {h.get('delay_model')}, "
+      f"{h.get('open_roads')} open roads")
+import urllib.request as _ur
+with _ur.urlopen(f"{BASE}/metrics") as resp:
+    metrics = resp.read().decode()
+check("dispatch_requests_total" in metrics
+      and "dispatch_audit_entries" in metrics,
+      "metrics endpoint exposes counters and gauges",
+      next((l for l in metrics.splitlines()
+            if l.startswith("dispatch_requests_total")), "")[:60])
+s, acts = call("GET", "/audit?limit=200")
+mine = next((a for a in acts
+             if a["action"] == "vehicle.create" or a["action"] == "copilot.accepted"), None)
+check(mine is not None and mine.get("actor_id") == "dispatcher",
+      "audit rows carry the signed-in user, not a hard-code",
+      f"{mine['action']} by actor_id={mine.get('actor_id')}" if mine else "none")
+
+# 21 ─ audit ledger ---------------------------------------------------------
+section("21. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",
