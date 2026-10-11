@@ -15,6 +15,7 @@ from routing import shortest_route, ranked_routes
 from planner import plan_shipments
 from zones import split_edges_by_zones
 from validator import validate_route
+from datagen import generate_world
 from typing import Literal
 from psycopg.types.json import Jsonb
 
@@ -1074,6 +1075,99 @@ def simulate_disruption(scenario: SimulateIn):
         )
     return {"scenario": scenario.model_dump(), "impact": impact,
             "summary": summary}
+
+
+class DatagenIn(BaseModel):
+    scale: Literal["small", "medium", "large"] = "small"
+    seed: int = 42
+    confirm: bool = False  # required to add data when tables are not empty
+
+SCALES = {
+    "small": {"locations": 6, "vehicles": 4, "drivers": 4, "shipments": 8},
+    "medium": {"locations": 12, "vehicles": 10, "drivers": 10,
+               "shipments": 30},
+    "large": {"locations": 16, "vehicles": 25, "drivers": 20,
+              "shipments": 80},
+}
+
+
+@app.post("/datagen")
+def run_datagen(body: DatagenIn):
+    """Fill the database with a synthetic world for demos and exploration.
+
+    Guard: refuses to mix synthetic rows into a database that already has
+    data unless confirm=true is passed explicitly.
+    """
+    counts = SCALES[body.scale]
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT (SELECT count(*) FROM locations) AS locations, "
+            "(SELECT count(*) FROM vehicles) AS vehicles").fetchone()
+        if existing["locations"] or existing["vehicles"]:
+            if not body.confirm:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Database is not empty. Pass confirm=true to add "
+                           "synthetic data anyway.",
+                )
+        world = generate_world(
+            body.seed, counts["locations"], counts["vehicles"],
+            counts["drivers"], counts["shipments"])
+
+        loc_ids = []
+        for loc in world["locations"]:
+            row = conn.execute(
+                "INSERT INTO locations (name, location_type, latitude, "
+                "longitude) VALUES (%s, %s, %s, %s) RETURNING id",
+                (loc["name"], loc["location_type"], loc["latitude"],
+                 loc["longitude"]),
+            ).fetchone()
+            loc_ids.append(row["id"])
+        for road in world["roads"]:
+            conn.execute(
+                "INSERT INTO road_edges (from_location_id, to_location_id, "
+                "distance_km, status, risk_score) VALUES (%s, %s, %s, %s, %s)",
+                (loc_ids[road["from"]], loc_ids[road["to"]],
+                 road["distance_km"], road["status"], road["risk_score"]),
+            )
+        for v in world["vehicles"]:
+            conn.execute(
+                "INSERT INTO vehicles (plate, vehicle_type, capacity_kg, "
+                "insurance_expiry, fitness_expiry) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (v["plate"], v["vehicle_type"], v["capacity_kg"],
+                 v["insurance_expiry"], v["fitness_expiry"]),
+            )
+        for d in world["drivers"]:
+            conn.execute(
+                "INSERT INTO drivers (full_name, licence_number, "
+                "licence_expiry, hazmat_certified) VALUES (%s, %s, %s, %s)",
+                (d["full_name"], d["licence_number"], d["licence_expiry"],
+                 d["hazmat_certified"]),
+            )
+        for s in world["shipments"]:
+            conn.execute(
+                "INSERT INTO shipments (description, weight_kg, "
+                "is_hazardous, origin_id, destination_id, "
+                "required_vehicle_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                (s["description"], s["weight_kg"], s["is_hazardous"],
+                 loc_ids[s["origin_id"]], loc_ids[s["destination_id"]],
+                 s["required_vehicle_type"]),
+            )
+        summary = {
+            "scale": body.scale, "seed": body.seed,
+            "locations": len(loc_ids),
+            "roads": len(world["roads"]),
+            "vehicles": len(world["vehicles"]),
+            "drivers": len(world["drivers"]),
+            "shipments": len(world["shipments"]),
+        }
+        append_audit(
+            conn, "datagen", "datagen.run", "allowed",
+            entity_type="datagen", entity_id=uuid4().hex[:12],
+            details=summary,
+        )
+    return summary
 
 
 class PlannerRequest(BaseModel):
