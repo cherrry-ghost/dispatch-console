@@ -18,10 +18,11 @@ from zones import split_edges_by_zones
 from validator import validate_route
 from datagen import generate_world
 from delay_model import (
-    FEATURES, MIN_HISTORY_FOR_TRAINING, MODEL_PATH, MODEL_VERSION,
-    load as load_model, mean_absolute_error as delay_model_mae,
-    model_exists, predict as predict_delay, route_features,
-    save as save_delay_model, train as train_delay_model, travel_minutes,
+    FEATURES, MIN_HISTORY_FOR_TRAINING, MODEL_VERSION,
+    explain as explain_delay, interval_coverage, load as load_model,
+    mean_absolute_error as delay_model_mae, model_exists,
+    predict as predict_delay, route_features, save as save_delay_model,
+    train as train_delay_model, travel_minutes,
 )
 from typing import Literal
 from psycopg.types.json import Jsonb
@@ -1455,9 +1456,10 @@ def train_model(body: TrainIn):
     rng.shuffle(samples)
     holdout_n = max(1, int(len(samples) * body.holdout_fraction))
     holdout, train_set = samples[:holdout_n], samples[holdout_n:]
-    model = train_delay_model(train_set)
-    mae = delay_model_mae(model, holdout)
-    save_delay_model(model)
+    models = train_delay_model(train_set)
+    mae = delay_model_mae(models, holdout)
+    coverage = interval_coverage(models, holdout)
+    save_delay_model(models)
     append_row = append_audit  # alias to keep the with-block short
     with get_connection() as conn:
         append_row(
@@ -1466,12 +1468,15 @@ def train_model(body: TrainIn):
             details={"samples": len(train_set),
                      "holdout_samples": len(holdout),
                      "mae_minutes_holdout": mae,
+                     "interval_coverage_holdout": coverage,
                      "model": "xgboost", "model_version": MODEL_VERSION,
                      "features": FEATURES},
         )
     return {"samples": len(train_set), "holdout_samples": len(holdout),
-            "mae_minutes_holdout": mae, "model": "xgboost",
-            "model_version": MODEL_VERSION, "features": FEATURES}
+            "mae_minutes_holdout": mae,
+            "interval_coverage_holdout": coverage,
+            "model": "xgboost", "model_version": MODEL_VERSION,
+            "features": FEATURES}
 
 
 class PredictIn(BaseModel):
@@ -1509,10 +1514,16 @@ def predict_eta(body: PredictIn):
             detail="Delay model is not trained yet. POST /model/train first.",
         )
     features = route_features(route, shipment)
-    model = load_model()
-    delay_pred = round(predict_delay(model, features), 1)
+    models = load_model()
+    delay_low, delay_pred, delay_high = predict_delay(models, features)
+    delay_low, delay_pred, delay_high = (round(delay_low, 1),
+                                         round(delay_pred, 1),
+                                         round(delay_high, 1))
     travel = travel_minutes(features)
     eta = travel + round(delay_pred)
+    eta_low = travel + round(delay_low)
+    eta_high = travel + round(delay_high)
+    explanation = explain_delay(models, features)
     with get_connection() as conn:
         append_audit(
             conn, "ai_delay_model", "eta.predicted", "allowed",
@@ -1528,11 +1539,18 @@ def predict_eta(body: PredictIn):
                      "features": features,
                      "predicted_delay_minutes": delay_pred,
                      "travel_minutes": travel, "eta_minutes": eta,
+                     "uncertainty": {"low_minutes": eta_low,
+                                     "high_minutes": eta_high},
+                     "explanation": explanation,
                      "model": "xgboost", "model_version": MODEL_VERSION},
         )
     return {"shipment_id": body.shipment_id, "eta_minutes": eta,
             "travel_minutes": travel,
             "predicted_delay_minutes": delay_pred,
+            "uncertainty": {"low_minutes": eta_low,
+                            "high_minutes": eta_high,
+                            "confidence": 0.8},
+            "explanation": explanation,
             "features_used": features,
             "model": {"name": "xgboost", "version": MODEL_VERSION}}
 

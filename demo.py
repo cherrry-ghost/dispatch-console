@@ -261,10 +261,18 @@ if check(s == 200, "model trained on completed history",
     target = pending[0]["id"]
     s1, p1 = call("POST", "/predict/eta", {"shipment_id": target})
     s2, p2 = call("POST", "/predict/eta", {"shipment_id": target})
-    check(s1 == 200, "ETA predicted",
-          f"drive {p1.get('travel_minutes'):.0f} min + delay "
-          f"{p1.get('predicted_delay_minutes'):.0f} min "
-          f"= ETA {p1.get('eta_minutes'):.0f} min")
+    unc = p1.get("uncertainty", {})
+    if check(s1 == 200, "ETA predicted with an uncertainty range",
+             f"drive {p1.get('travel_minutes'):.0f} min + delay "
+             f"{p1.get('predicted_delay_minutes'):.0f} min "
+             f"= ETA {p1.get('eta_minutes'):.0f} min "
+             f"(likely {unc.get('low_minutes', 0):.0f}-"
+             f"{unc.get('high_minutes', 0):.0f})"):
+        ok("range brackets the answer",
+           f"confidence {int(unc.get('confidence', 0) * 100)}%")
+    expl = p1.get("explanation", {})
+    if check(bool(expl.get("top_factors")), "model explains itself"):
+        ok("main reason", expl["summary"][:90])
     check(p1.get("eta_minutes") == p2.get("eta_minutes"),
           "prediction is deterministic (same input, same answer)")
     s, ship = call("GET", "/shipments")
