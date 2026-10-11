@@ -3,6 +3,7 @@ import {
   MapContainer,
   TileLayer,
   CircleMarker,
+  Circle,
   Polyline,
   Tooltip,
 } from "react-leaflet";
@@ -18,8 +19,12 @@ import MediaPanel from "./MediaPanel";
 import NotificationsPanel from "./NotificationsPanel";
 
 const API_URL = "http://localhost:8010";
-const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments"];
+const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments", "zones"];
 const STATUS_COLOR = { pending: "#64748b", assigned: "#38bdf8" };
+const ZONE_STYLE = {
+  forbidden: { color: "#f87171", fillColor: "#f87171", fillOpacity: 0.14, weight: 1.5 },
+  alert: { color: "#fbbf24", fillColor: "#fbbf24", fillOpacity: 0.10, weight: 1.5 },
+};
 
 const TABS = [
   ["overview", "Overview"],
@@ -34,6 +39,7 @@ function App() {
   const [tab, setTab] = useState("overview");
   const [data, setData] = useState({
     vehicles: [], drivers: [], locations: [], shipments: [], assignments: [],
+    zones: [],
   });
   const [health, setHealth] = useState(null);
   const [error, setError] = useState(null);
@@ -60,7 +66,7 @@ function App() {
       .catch((err) => setError(err.message));
   }, [version]);
 
-  const { vehicles, drivers, locations, shipments, assignments } = data;
+  const { vehicles, drivers, locations, shipments, assignments, zones } = data;
   const locById = Object.fromEntries(locations.map((l) => [l.id, l]));
   const driverById = Object.fromEntries(drivers.map((d) => [d.id, d]));
   const shipById = Object.fromEntries(shipments.map((s) => [s.id, s]));
@@ -165,6 +171,22 @@ function App() {
                     </Polyline>
                   );
                 })}
+                {zones.map((z) => (
+                  <Circle
+                    key={`zone-${z.id}`}
+                    center={[z.center_lat, z.center_lng]}
+                    radius={z.radius_km * 1000}
+                    pathOptions={z.active
+                      ? (ZONE_STYLE[z.zone_type] || ZONE_STYLE.alert)
+                      : { color: "#5f7495", fillColor: "#5f7495",
+                          fillOpacity: 0.05, weight: 1, dashArray: "4 6" }}
+                  >
+                    <Tooltip sticky>
+                      {z.zone_type === "forbidden" ? "FORBIDDEN" : "ALERT"} zone: {z.name} ({z.radius_km} km)
+                      {z.active ? "" : " — inactive"}
+                    </Tooltip>
+                  </Circle>
+                ))}
                 {locations.map((l) => (
                   <CircleMarker
                     key={l.id}
@@ -180,6 +202,8 @@ function App() {
               </MapContainer>
               <p style={{ marginBottom: 0 }}>
                 Red dots = locations. Lines = shipments (grey pending, blue assigned, green other).
+                Shaded areas = zones: <span className="text-danger">red forbidden</span> (routing avoids, entry alerts),
+                <span className="text-warn"> amber alert</span> (warning only).
               </p>
             </div>
 
