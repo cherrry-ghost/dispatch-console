@@ -390,8 +390,73 @@ check(s == 200 and abs(pos["latitude"] - (locs[0]["latitude"] + 0.06)) < 1e-9,
       "latest position stored server-side",
       f"lat {pos['latitude']:.4f}, source {pos['source']}")
 
-# 14 ─ audit ledger ---------------------------------------------------------
-section("14. Tamper-proof audit ledger")
+# 14 ─ event pipeline and geofencing -----------------------------------------
+section("14. Event pipeline and geofencing")
+
+async def run_events(vid, base_pt):
+    ws_base = BASE.replace("http", "ws", 1)
+    s, a = call("POST", "/locations", {
+        "name": f"Event depot {rng.randint(1, 99999)}",
+        "location_type": "depot", "latitude": base_pt[0] + 0.30,
+        "longitude": base_pt[1] + 0.30, "is_depot": True})
+    check(s == 200, "test locations created for the event demo")
+    s, b = call("POST", "/locations", {
+        "name": f"Event stop {rng.randint(1, 99999)}",
+        "location_type": "warehouse",
+        "latitude": base_pt[0] + 0.40, "longitude": base_pt[1] + 0.40})
+    s, edge = call("POST", "/road-edges", {
+        "from_location_id": a["id"], "to_location_id": b["id"],
+        "distance_km": 25})
+    live_events = []
+    async with websockets.connect(f"{ws_base}/ws/events") as listener:
+        call("POST", f"/road-edges/{edge['id']}/status",
+             {"status": "closed"})
+        closed_evt = json.loads(await asyncio.wait_for(listener.recv(), 10))
+        call("POST", f"/road-edges/{edge['id']}/status",
+             {"status": "open"})
+        reopened_evt = json.loads(await asyncio.wait_for(listener.recv(), 10))
+        s, fence = call("POST", "/zones", {
+            "name": f"Demo geofence {rng.randint(1, 99999)}",
+            "center_lat": base_pt[0] + 0.01, "center_lng": base_pt[1],
+            "radius_km": 3, "zone_type": "geofence_alert"})
+        call("POST", f"/vehicles/{vid}/position", {   # enter the fence
+            "latitude": base_pt[0] + 0.01, "longitude": base_pt[1]})
+        enter_evt = json.loads(await asyncio.wait_for(listener.recv(), 10))
+        call("POST", f"/vehicles/{vid}/position", {   # leave again
+            "latitude": base_pt[0] + 0.10, "longitude": base_pt[1]})
+        exit_evt = json.loads(await asyncio.wait_for(listener.recv(), 10))
+        if s == 200:
+            call("POST", f"/zones/{fence['id']}/status", {"active": False})
+    live_events = [closed_evt, reopened_evt, enter_evt, exit_evt]
+    # routing still works through an alert zone (it never blocks)
+    call("POST", "/zones", {
+        "name": f"Demo watch circle {rng.randint(1, 99999)}",
+        "center_lat": base_pt[0], "center_lng": base_pt[1], "radius_km": 30,
+        "zone_type": "geofence_alert"})
+    s, r = call("GET", f"/routes?from_id={a['id']}&to_id={b['id']}")
+    blocked_free = r.get("blocked_by_zones") == [] if s == 200 else False
+    s, zs = call("GET", "/zones")
+    for z in zs:
+        if z["name"].startswith("Demo watch circle"):
+            call("POST", f"/zones/{z['id']}/status", {"active": False})
+    return live_events, blocked_free
+
+vid2 = props[0]["vehicle_id"]
+events_seen, no_block = asyncio.run(run_events(
+    vid2, (locs[1]["latitude"], locs[1]["longitude"])))
+check([e["kind"] for e in events_seen] ==
+      ["road.closed", "road.reopened", "geofence.enter", "geofence.exit"],
+      "every crossing and closure arrived live",
+      " -> ".join(e["kind"] for e in events_seen))
+check(events_seen[2]["details"]["zone_type"] == "geofence_alert",
+      "geofence events carry their zone type")
+check(no_block, "alert zones warn but never block routing")
+s, feed = call("GET", "/events?limit=10")
+check(s == 200 and len(feed) >= 4, "event history is queryable",
+      f"{len(feed)} recent events stored")
+
+# 15 ─ audit ledger ---------------------------------------------------------
+section("15. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",

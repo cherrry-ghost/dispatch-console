@@ -2,17 +2,20 @@
 zone alerts and the audit trail around them."""
 import pytest
 
+import events
 import main
 
 
 @pytest.fixture(autouse=True)
 def clean_tracking_state():
     """Reset in-memory tracking state so tests are independent."""
-    main._in_zone_state.clear()
+    events._zone_state.clear()
     main.live.viewers.clear()
+    events.hub.viewers.clear()
     yield
-    main._in_zone_state.clear()
+    events._zone_state.clear()
     main.live.viewers.clear()
+    events.hub.viewers.clear()
 
 
 def make_vehicle(client):

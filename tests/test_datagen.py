@@ -38,8 +38,8 @@ def test_same_seed_builds_same_world(client):
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute(
             "TRUNCATE audit_log, approvals, incident_evidence, incidents, "
-            "zones, vehicle_positions, road_edges, assignments, shipments, "
-            "drivers, vehicles, locations RESTART IDENTITY")
+            "events, zones, vehicle_positions, road_edges, assignments, "
+            "shipments, drivers, vehicles, locations RESTART IDENTITY")
     run_datagen(client, {"scale": "small", "seed": 99})
     second = client.get("/vehicles").json()
 

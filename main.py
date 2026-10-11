@@ -29,7 +29,7 @@ from delay_model import (
 from typing import Literal
 from psycopg.types.json import Jsonb
 from fastapi import WebSocket, WebSocketDisconnect
-from zones import point_in_zone
+from events import check_geofences, emit, hub
 
 app = FastAPI()
 app.add_middleware(
@@ -61,10 +61,6 @@ class LiveManager:
 
 
 live = LiveManager()
-# last known in-zone state per vehicle, so zone alerts fire on transitions
-_in_zone_state = {}
-
-
 def _latest_positions(conn):
     return conn.execute(
         "SELECT DISTINCT ON (vehicle_id) vehicle_id, latitude, longitude, "
@@ -74,7 +70,7 @@ def _latest_positions(conn):
 
 
 async def _ingest_position(vehicle_id, lat, lng, speed_kmh, source):
-    """Validate, store, zone-check and broadcast one vehicle position."""
+    """Validate, store, geofence-check and broadcast one vehicle position."""
     with get_connection() as conn:
         vehicle = conn.execute(
             "SELECT id FROM vehicles WHERE id = %s", (vehicle_id,)
@@ -86,23 +82,27 @@ async def _ingest_position(vehicle_id, lat, lng, speed_kmh, source):
             "speed_kmh, source) VALUES (%s, %s, %s, %s, %s)",
             (vehicle_id, lat, lng, speed_kmh, source),
         )
-        zones = conn.execute(
-            "SELECT * FROM zones WHERE active ORDER BY id").fetchall()
-    hit = next((z for z in zones if point_in_zone(lat, lng, z)), None)
-    was_in = _in_zone_state.get(vehicle_id, False)
-    alert = None
-    if hit is not None:
-        alert = {"zone_id": hit["id"], "zone_name": hit["name"],
-                 "radius_km": hit["radius_km"]}
-        if not was_in:
-            with get_connection() as conn:
-                append_audit(
-                    conn, "system", "vehicle.in_zone", "warning",
-                    entity_type="vehicle", entity_id=str(vehicle_id),
-                    details={"zone": hit["name"],
-                             "latitude": lat, "longitude": lng},
-                )
-    _in_zone_state[vehicle_id] = hit is not None
+        alert, crossings = check_geofences(conn, vehicle_id, lat, lng)
+        emitted = [
+            emit(conn, kind, severity, vehicle_id=vehicle_id,
+                 zone_id=zone["id"],
+                 details={"zone": zone["name"],
+                          "zone_type": zone["zone_type"],
+                          "latitude": lat, "longitude": lng})
+            for kind, severity, zone in crossings
+        ]
+        # a vehicle on forbidden ground stays an audit-level warning
+        if any(e["kind"] == "vehicle.in_zone" for e in emitted):
+            zone = next(z for _, _, z in crossings
+                        if z["zone_type"] == "forbidden")
+            append_audit(
+                conn, "system", "vehicle.in_zone", "warning",
+                entity_type="vehicle", entity_id=str(vehicle_id),
+                details={"zone": zone["name"],
+                         "latitude": lat, "longitude": lng},
+            )
+    for event in emitted:
+        await hub.broadcast(event)
     await live.broadcast({
         "type": "position", "vehicle_id": vehicle_id,
         "latitude": lat, "longitude": lng,
@@ -145,6 +145,12 @@ def latest_position(vehicle_id: int):
 def all_latest_positions():
     with get_connection() as conn:
         return _latest_positions(conn)
+
+
+async def broadcast_event(event):
+    """Push one pipeline event to console viewers (no-op if nothing fired)."""
+    if event:
+        await hub.broadcast(event)
 
 
 @app.websocket("/ws/vehicle/{vehicle_id}")
@@ -202,6 +208,42 @@ async def ws_live(ws: WebSocket):
         pass
     finally:
         live.disconnect(ws)
+
+
+@app.websocket("/ws/events")
+async def ws_events(ws: WebSocket):
+    """Console channel: the event pipeline's live feed (geofence crossings,
+    road closures, assignment milestones)."""
+    await hub.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.disconnect(ws)
+
+
+@app.get("/events")
+def list_events(kind: str | None = None, vehicle_id: int | None = None,
+                limit: int = 100):
+    """The event pipeline's history, newest first, with simple filters."""
+    limit = max(1, min(limit, 500))
+    clauses, params = [], []
+    if kind:
+        clauses.append("kind = %s")
+        params.append(kind)
+    if vehicle_id is not None:
+        clauses.append("vehicle_id = %s")
+        params.append(vehicle_id)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_connection() as conn:
+        return conn.execute(
+            f"SELECT * FROM events{where} "
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (*params, limit),
+        ).fetchall()
+
 
 class VehicleIn(BaseModel):
     plate: str
@@ -449,7 +491,7 @@ def load_entities(conn, req):
 
 
 @app.post("/assignments")
-def create_assignment(assignment: AssignmentIn, response: Response):
+async def create_assignment(assignment: AssignmentIn, response: Response):
     req = assignment.model_dump()
     with get_connection() as conn:
         vehicle, driver, shipment = load_entities(conn, req)
@@ -503,6 +545,11 @@ def create_assignment(assignment: AssignmentIn, response: Response):
                 entity_type="shipment", entity_id=entity_id,
                 details=audit_details,
             )
+            created = emit(
+                conn, "assignment.created", "info",
+                vehicle_id=req["vehicle_id"], shipment_id=req["shipment_id"],
+                details={"driver_id": req["driver_id"]},
+            )
     except psycopg.errors.ForeignKeyViolation:
         raise HTTPException(
             status_code=400,
@@ -513,6 +560,7 @@ def create_assignment(assignment: AssignmentIn, response: Response):
             status_code=409,
             detail="This shipment already has an active assignment",
         )
+    await broadcast_event(created)
     return {**row, **req, "warnings": []}
 
 
@@ -565,7 +613,7 @@ def decide_approval(approval_id: int, body: DecisionIn):
                     ).fetchall()
                 }
                 zones = conn.execute(
-                    "SELECT * FROM zones WHERE active ORDER BY id"
+                    "SELECT * FROM zones WHERE active AND zone_type = 'forbidden' ORDER BY id"
                 ).fetchall()
                 open_pairs = {
                     (min(e["from_location_id"], e["to_location_id"]),
@@ -704,15 +752,17 @@ class ZoneIn(BaseModel):
     center_lat: float = Field(ge=-90, le=90)
     center_lng: float = Field(ge=-180, le=180)
     radius_km: float = Field(gt=0)
+    zone_type: Literal["forbidden", "geofence_alert"] = "forbidden"
 
 
 @app.post("/zones")
 def create_zone(zone: ZoneIn):
     with get_connection() as conn:
         row = conn.execute(
-            "INSERT INTO zones (name, center_lat, center_lng, radius_km) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
-            (zone.name, zone.center_lat, zone.center_lng, zone.radius_km),
+            "INSERT INTO zones (name, center_lat, center_lng, radius_km, "
+            "zone_type) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (zone.name, zone.center_lat, zone.center_lng, zone.radius_km,
+             zone.zone_type),
         ).fetchone()
         append_audit(
             conn, "dispatcher", "zone.create", "allowed",
@@ -726,8 +776,8 @@ def create_zone(zone: ZoneIn):
 def list_zones():
     with get_connection() as conn:
         return conn.execute(
-            "SELECT id, name, center_lat, center_lng, radius_km, active, "
-            "created_at FROM zones ORDER BY id"
+            "SELECT id, name, center_lat, center_lng, radius_km, zone_type, "
+            "active, created_at FROM zones ORDER BY id"
         ).fetchall()
 
 
@@ -758,7 +808,7 @@ class RoadStatusIn(BaseModel):
 
 
 @app.post("/road-edges/{edge_id}/status")
-def set_road_status(edge_id: int, body: RoadStatusIn):
+async def set_road_status(edge_id: int, body: RoadStatusIn):
     with get_connection() as conn:
         row = conn.execute(
             "UPDATE road_edges SET status = %s WHERE id = %s "
@@ -774,6 +824,15 @@ def set_road_status(edge_id: int, body: RoadStatusIn):
                               row["to_location_id"]],
                      "status": body.status},
         )
+        event = emit(
+            conn,
+            "road.closed" if body.status == "closed" else "road.reopened",
+            "warning" if body.status == "closed" else "info",
+            details={"road_edge_id": edge_id,
+                     "from_location_id": row["from_location_id"],
+                     "to_location_id": row["to_location_id"]},
+        )
+    await broadcast_event(event)
     return {"id": edge_id, "status": body.status}
 
 
@@ -1007,7 +1066,7 @@ def _compute_route(conn, from_id, to_id, risk_weight=0.0):
         ).fetchall()
     }
     zones = conn.execute(
-        "SELECT * FROM zones WHERE active ORDER BY id"
+        "SELECT * FROM zones WHERE active AND zone_type = 'forbidden' ORDER BY id"
     ).fetchall()
     allowed_edges, blocked = split_edges_by_zones(edges, zones, locations)
     blocked_names = sorted({z["name"] for _, z in blocked})
@@ -1100,7 +1159,7 @@ def list_routes(from_id: int, to_id: int):
             ).fetchall()
         }
         zones = conn.execute(
-            "SELECT * FROM zones WHERE active ORDER BY id"
+            "SELECT * FROM zones WHERE active AND zone_type = 'forbidden' ORDER BY id"
         ).fetchall()
         allowed_edges, blocked = split_edges_by_zones(edges, zones, locations)
         routes = ranked_routes(allowed_edges, from_id, to_id)
@@ -1294,7 +1353,7 @@ def _run_scenario(actions):
             ).fetchall()
         }
         zones = conn.execute(
-            "SELECT * FROM zones WHERE active ORDER BY id"
+            "SELECT * FROM zones WHERE active AND zone_type = 'forbidden' ORDER BY id"
         ).fetchall()
         shipments = conn.execute(
             "SELECT id, origin_id, destination_id FROM shipments ORDER BY id"
