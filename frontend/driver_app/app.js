@@ -4,6 +4,7 @@
 const QUEUE_KEY = "driver_pending_deliveries";
 const JOBS_KEY = "driver_last_jobs";
 const TOKEN_KEY = "driver_token";
+const NAME_KEY = "driver_name";
 
 function token() { return localStorage.getItem(TOKEN_KEY); }
 function authHeaders(extra = {}) {
@@ -13,6 +14,28 @@ function authHeaders(extra = {}) {
 }
 
 const $ = (id) => document.getElementById(id);
+
+// signed-in state in the header + sign out
+function refreshHeader() {
+  const name = localStorage.getItem(NAME_KEY);
+  $("who").innerHTML = token() && name ? `Signed in: <b>${name}</b>` : "";
+  $("logout").style.display = token() ? "inline-block" : "none";
+  $("loginBox").style.display = token() ? "none" : "";
+}
+function signOut() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(NAME_KEY);
+  refreshHeader();
+  $("jobs").innerHTML = `<p class="meta">Sign in to see your jobs.</p>`;
+}
+function sessionExpired() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(NAME_KEY);
+  refreshHeader();
+  $("loginMsg").textContent = "Session expired — sign in again.";
+}
+$("logout").addEventListener("click", signOut);
+refreshHeader();
 
 function setNet(online) {
   const el = $("net");
@@ -47,6 +70,10 @@ async function deliver(job, note, photoFile) {
   const res = await fetch(
     `/driver/${job.driver_id}/jobs/${job.assignment_id}/deliver`,
     { method: "POST", body: form, headers: authHeaders() });
+  if (res.status === 401) {
+    sessionExpired();
+    throw new Error("session expired — sign in again");
+  }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -167,6 +194,12 @@ function render(data, driverId) {
           `/driver/${driverId}/jobs/${id}/incident`,
           { method: "POST", headers: authHeaders({"Content-Type": "application/json"}),
             body: JSON.stringify({ description: note, incident_type: kind }) });
+        if (res.status === 401) {
+          sessionExpired();
+          btn.disabled = false;
+          btn.textContent = "Retry";
+          return;
+        }
         if (!res.ok) throw new Error(await res.text());
         box.innerHTML = `<span class="reported">✔ Report sent — the office and the customer are informed.</span>`;
       } catch (err) {
@@ -219,7 +252,9 @@ $("login").addEventListener("click", async () => {
     const body = await res.json();
     if (!res.ok) { $("loginMsg").textContent = body.detail || "Sign-in failed"; return; }
     localStorage.setItem(TOKEN_KEY, body.token);
-    $("loginBox").style.display = "none";
+    localStorage.setItem(NAME_KEY, body.full_name || `driver #${body.driver_id}`);
+    $("pin").value = "";
+    refreshHeader();
     loadJobs();
   } catch (err) {
     $("loginMsg").textContent = "Could not reach the server: " + err.message;
@@ -228,6 +263,6 @@ $("login").addEventListener("click", async () => {
 
 // already signed in? skip the login box
 if (token()) {
-  $("loginBox").style.display = "none";
+  refreshHeader();
   loadJobs();
 }

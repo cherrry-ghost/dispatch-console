@@ -142,7 +142,7 @@ def test_pwa_files_are_served(client):
     assert "Driver App" in shell.text
     for path, marker in [("app.js", "flushQueue"),
                          ("manifest.webmanifest", '"short_name"'),
-                         ("sw.js", "driver-shell-v1"),
+                         ("sw.js", "driver-shell-"),
                          ("icon.svg", "<svg")]:
         res = client.get(f"/driver-app/{path}")
         assert res.status_code == 200, path
