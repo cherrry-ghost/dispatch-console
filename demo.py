@@ -320,8 +320,18 @@ if check(s == 200, "playbook saved with its tested impact"):
                  {"status": "open"})
     ok("cleaned up (zone off, road reopened)")
 
-# 12 ─ audit ledger ---------------------------------------------------------
-section("12. Tamper-proof audit ledger")
+# 12 ─ anomaly detection ----------------------------------------------------
+section("12. Anomaly detection")
+s, an = call("GET", "/anomalies")
+if check(s == 200, "history scanned for anomalies",
+         f"{an.get('summary', {}).get('checked')} trips checked "
+         f"({an.get('summary', {}).get('delay_check')} mode), "
+         f"{an.get('summary', {}).get('flagged')} flagged"):
+    for a in an.get("anomalies", [])[:2]:
+        ok(f"finding: {a['kind']} ({a['severity']})", a["detail"][:90])
+
+# 13 ─ audit ledger ---------------------------------------------------------
+section("13. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",
