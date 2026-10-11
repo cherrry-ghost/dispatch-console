@@ -5,6 +5,7 @@ from audit import append_audit, verify_chain
 import hashlib
 import os
 
+import networkx as nx
 import psycopg
 from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -990,62 +991,79 @@ class SimulateIn(BaseModel):
     zone: ScenarioZoneIn | None = None
 
 
-def _scenario_network(scenario: SimulateIn, edges, zones):
-    """Return (edges_after, zones_after) with the hypothetical disruption
+def _scenario_network(actions, edges, zones):
+    """Return (edges_after, zones_after) with the hypothetical disruptions
     applied to copies - the real rows are never touched."""
     edges_after = [dict(e) for e in edges]
     zones_after = list(zones)
-    if scenario.kind == "close_road":
-        for e in edges_after:
-            if e["id"] == scenario.edge_id:
-                e["status"] = "closed"
-    elif scenario.kind == "raise_risk":
-        for e in edges_after:
-            if e["id"] == scenario.edge_id:
-                e["risk_score"] = scenario.risk_score
-    else:  # add_zone
-        zones_after.append({
-            "id": -1, "active": True,
-            "name": scenario.zone.name,
-            "center_lat": scenario.zone.center_lat,
-            "center_lng": scenario.zone.center_lng,
-            "radius_km": scenario.zone.radius_km,
-        })
+    for action in actions:
+        if action.kind == "close_road":
+            for e in edges_after:
+                if e["id"] == action.edge_id:
+                    e["status"] = "closed"
+        elif action.kind == "raise_risk":
+            for e in edges_after:
+                if e["id"] == action.edge_id:
+                    e["risk_score"] = action.risk_score
+        else:  # add_zone
+            zones_after.append({
+                "id": -1, "active": True,
+                "name": action.zone.name,
+                "center_lat": action.zone.center_lat,
+                "center_lng": action.zone.center_lng,
+                "radius_km": action.zone.radius_km,
+            })
     return edges_after, zones_after
 
 
-@app.post("/simulate/disruption")
-def simulate_disruption(scenario: SimulateIn):
-    if scenario.kind in ("close_road", "raise_risk") and scenario.edge_id is None:
-        raise HTTPException(
-            status_code=422, detail="edge_id is required for this scenario")
-    if scenario.kind == "raise_risk" and scenario.risk_score is None:
-        raise HTTPException(
-            status_code=422, detail="risk_score is required for raise_risk")
-    if scenario.kind == "add_zone" and scenario.zone is None:
-        raise HTTPException(
-            status_code=422, detail="zone is required for add_zone")
+def _validate_actions(actions, edges):
+    """Every action must point at a real road and carry its parameters."""
+    for i, action in enumerate(actions):
+        if action.kind in ("close_road", "raise_risk"):
+            if action.edge_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Action {i}: edge_id is required for "
+                           f"{action.kind}")
+            if not any(e["id"] == action.edge_id for e in edges):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Action {i}: road {action.edge_id} not found")
+            if action.kind == "raise_risk" and action.risk_score is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Action {i}: risk_score is required for "
+                           f"raise_risk")
+        elif action.zone is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Action {i}: zone is required for add_zone")
 
-    with get_connection() as conn:
-        edges = conn.execute("SELECT * FROM road_edges").fetchall()
-        if scenario.edge_id is not None and not any(
-            e["id"] == scenario.edge_id for e in edges
-        ):
-            raise HTTPException(status_code=404, detail="Road not found")
-        locations = {
-            r["id"]: r
-            for r in conn.execute(
-                "SELECT id, latitude, longitude FROM locations"
-            ).fetchall()
-        }
-        zones = conn.execute(
-            "SELECT * FROM zones WHERE active ORDER BY id"
-        ).fetchall()
-        shipments = conn.execute(
-            "SELECT id, origin_id, destination_id FROM shipments ORDER BY id"
-        ).fetchall()
 
-    edges_after, zones_after = _scenario_network(scenario, edges, zones)
+def _network_health(edges, edges_after):
+    """How much of the road network survives the scenario."""
+    before_open = sum(1 for e in edges if e["status"] == "open")
+    after_open = sum(1 for e in edges_after if e["status"] == "open")
+    g = nx.Graph()
+    for e in edges_after:
+        if e["status"] == "open":
+            g.add_edge(e["from_location_id"], e["to_location_id"])
+    nodes = set(g.nodes)
+    if not nodes:
+        return {"roads_open_before": before_open,
+                "roads_open_after": after_open,
+                "roads_closed_by_scenario": before_open - after_open,
+                "largest_connected_share": 0.0}
+    biggest = max(len(c) for c in nx.connected_components(g))
+    return {"roads_open_before": before_open,
+            "roads_open_after": after_open,
+            "roads_closed_by_scenario": before_open - after_open,
+            "largest_connected_share": round(biggest / len(nodes), 3)}
+
+
+def _compute_impact(edges, zones, edges_after, zones_after, locations,
+                    shipments):
+    """Per-shipment before/after routes plus a plain summary."""
     base_allowed, _ = split_edges_by_zones(edges, zones, locations)
     after_allowed, _ = split_edges_by_zones(edges_after, zones_after, locations)
 
@@ -1093,14 +1111,198 @@ def simulate_disruption(scenario: SimulateIn):
         "unaffected": sum(1 for i in impact if i["status"] == "unaffected"),
         "max_extra_km": max((i["delta_km"] or 0 for i in impact), default=0),
     }
+    return impact, summary
+
+
+def _run_scenario(actions):
+    """Simulate the given actions on copies. Returns the full result dict."""
+    with get_connection() as conn:
+        edges = conn.execute("SELECT * FROM road_edges").fetchall()
+        locations = {
+            r["id"]: r
+            for r in conn.execute(
+                "SELECT id, latitude, longitude FROM locations"
+            ).fetchall()
+        }
+        zones = conn.execute(
+            "SELECT * FROM zones WHERE active ORDER BY id"
+        ).fetchall()
+        shipments = conn.execute(
+            "SELECT id, origin_id, destination_id FROM shipments ORDER BY id"
+        ).fetchall()
+    _validate_actions(actions, edges)
+    edges_after, zones_after = _scenario_network(actions, edges, zones)
+    impact, summary = _compute_impact(edges, zones, edges_after, zones_after,
+                                      locations, shipments)
+    return {"actions": [a.model_dump() for a in actions],
+            "network": _network_health(edges, edges_after),
+            "impact": impact, "summary": summary}
+
+
+@app.post("/simulate/disruption")
+def simulate_disruption(scenario: SimulateIn):
+    result = _run_scenario([scenario])
     with get_connection() as conn:
         append_audit(
             conn, "dispatcher", "simulation.run", "allowed",
             entity_type="simulation", entity_id=uuid4().hex[:12],
-            details={"scenario": scenario.model_dump(), "summary": summary},
+            details={"scenario": scenario.model_dump(),
+                     "summary": result["summary"]},
         )
-    return {"scenario": scenario.model_dump(), "impact": impact,
-            "summary": summary}
+    return {"scenario": scenario.model_dump(), "impact": result["impact"],
+            "summary": result["summary"]}
+
+
+class ScenarioIn(BaseModel):
+    actions: list[SimulateIn] = Field(min_length=1, max_length=20)
+
+
+@app.post("/simulate/scenario")
+def simulate_scenario(body: ScenarioIn):
+    result = _run_scenario(body.actions)
+    with get_connection() as conn:
+        append_audit(
+            conn, "dispatcher", "simulation.scenario", "allowed",
+            entity_type="simulation", entity_id=uuid4().hex[:12],
+            details={"actions": result["actions"],
+                     "network": result["network"],
+                     "summary": result["summary"]},
+        )
+    return result
+
+
+class PlaybookIn(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    actions: list[SimulateIn] = Field(min_length=1, max_length=20)
+
+
+@app.get("/playbooks")
+def list_playbooks():
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, name, description, scenario, last_impact, tested_at, "
+            "created_by, created_at FROM playbooks ORDER BY id"
+        ).fetchall()
+    return rows
+
+
+@app.post("/playbooks")
+def create_playbook(body: PlaybookIn):
+    # a playbook may only be saved after its scenario passed a simulation
+    result = _run_scenario(body.actions)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO playbooks (name, description, scenario, "
+                "last_impact) VALUES (%s, %s, %s, %s) "
+                "RETURNING id, tested_at",
+                (body.name, body.description,
+                 Jsonb(result["actions"]),
+                 Jsonb({"network": result["network"],
+                        "summary": result["summary"]})),
+            ).fetchone()
+            append_audit(
+                conn, "manager", "playbook.create", "allowed",
+                entity_type="playbook", entity_id=str(row["id"]),
+                details={"name": body.name, "actions": result["actions"],
+                         "summary": result["summary"]},
+            )
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(
+            status_code=409,
+            detail="A playbook with this name already exists")
+    return {"id": row["id"], "name": body.name,
+            "tested_at": row["tested_at"],
+            "network": result["network"], "summary": result["summary"]}
+
+
+def _load_playbook(conn, playbook_id):
+    row = conn.execute(
+        "SELECT * FROM playbooks WHERE id = %s", (playbook_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Playbook not found")
+    return row
+
+
+@app.post("/playbooks/{playbook_id}/test")
+def test_playbook(playbook_id: int):
+    """Re-run the stored scenario so the recorded impact stays honest."""
+    with get_connection() as conn:
+        row = _load_playbook(conn, playbook_id)
+    actions = [SimulateIn(**a) for a in row["scenario"]]
+    result = _run_scenario(actions)
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE playbooks SET last_impact = %s, tested_at = now() "
+            "WHERE id = %s",
+            (Jsonb({"network": result["network"],
+                    "summary": result["summary"]}), playbook_id),
+        )
+        append_audit(
+            conn, "manager", "playbook.test", "allowed",
+            entity_type="playbook", entity_id=str(playbook_id),
+            details={"name": row["name"], "summary": result["summary"]},
+        )
+    return {"id": playbook_id, "name": row["name"],
+            "network": result["network"], "summary": result["summary"]}
+
+
+@app.post("/playbooks/{playbook_id}/apply")
+def apply_playbook(playbook_id: int):
+    """Apply the pre-approved response for real: close roads, add zones,
+    raise risks. Idempotent - already-done steps are noted, not repeated."""
+    with get_connection() as conn:
+        row = _load_playbook(conn, playbook_id)
+        applied, skipped = [], []
+        for i, action in enumerate(row["scenario"]):
+            if action["kind"] == "close_road":
+                edge = conn.execute(
+                    "SELECT id, status FROM road_edges WHERE id = %s",
+                    (action["edge_id"],)).fetchone()
+                if edge is None:
+                    skipped.append({"action": i, "reason": "road vanished"})
+                elif edge["status"] == "closed":
+                    skipped.append({"action": i,
+                                    "reason": "road already closed"})
+                else:
+                    conn.execute(
+                        "UPDATE road_edges SET status = 'closed' WHERE id = %s",
+                        (action["edge_id"],))
+                    applied.append({"action": i, "kind": "close_road",
+                                    "edge_id": action["edge_id"]})
+            elif action["kind"] == "raise_risk":
+                edge = conn.execute(
+                    "SELECT id FROM road_edges WHERE id = %s",
+                    (action["edge_id"],)).fetchone()
+                if edge is None:
+                    skipped.append({"action": i, "reason": "road vanished"})
+                else:
+                    conn.execute(
+                        "UPDATE road_edges SET risk_score = %s WHERE id = %s",
+                        (action["risk_score"], action["edge_id"]))
+                    applied.append({"action": i, "kind": "raise_risk",
+                                    "edge_id": action["edge_id"],
+                                    "risk_score": action["risk_score"]})
+            else:  # add_zone
+                zone = conn.execute(
+                    "INSERT INTO zones (name, center_lat, center_lng, "
+                    "radius_km, active) VALUES (%s, %s, %s, %s, TRUE) "
+                    "RETURNING id",
+                    (action["zone"]["name"], action["zone"]["center_lat"],
+                     action["zone"]["center_lng"],
+                     action["zone"]["radius_km"])).fetchone()
+                applied.append({"action": i, "kind": "add_zone",
+                                "zone_id": zone["id"]})
+        append_audit(
+            conn, "manager", "playbook.apply", "allowed",
+            entity_type="playbook", entity_id=str(playbook_id),
+            details={"name": row["name"], "applied": applied,
+                     "skipped": skipped},
+        )
+    return {"id": playbook_id, "name": row["name"],
+            "applied": applied, "skipped": skipped}
 
 
 class DatagenIn(BaseModel):
