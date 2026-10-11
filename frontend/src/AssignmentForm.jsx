@@ -49,45 +49,47 @@ export default function AssignmentForm({ shipments, vehicles, drivers, onDone })
     }
   };
 
-  const color = { ok: "#16a34a", blocked: "#dc2626", error: "#ca8a04" };
+  const color = { ok: "text-ok", blocked: "text-danger", error: "text-warn" };
 
   return (
     <div>
-      <h2>Assign a Shipment</h2>
-      <select value={shipmentId} onChange={(e) => setShipmentId(e.target.value)}>
-        <option value="">Shipment...</option>
-        {shipments.map((s) => (
-          <option key={s.id} value={s.id}>
-            #{s.id} {s.description} ({s.status})
-          </option>
-        ))}
-      </select>{" "}
-      <select value={vehicleId} onChange={(e) => setVehicleId(e.target.value)}>
-        <option value="">Vehicle...</option>
-        {vehicles.map((v) => (
-          <option key={v.id} value={v.id}>
-            {v.plate} ({v.vehicle_type}, {v.capacity_kg} kg)
-          </option>
-        ))}
-      </select>{" "}
-      <select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
-        <option value="">Driver...</option>
-        {drivers.map((d) => (
-          <option key={d.id} value={d.id}>{d.full_name}</option>
-        ))}
-      </select>{" "}
-      <input
-        placeholder="Reason (optional)"
-        value={reason}
-        onChange={(e) => setReason(e.target.value)}
-      />{" "}
-      <button onClick={submit}>Assign</button>
+      <h2>Assign a shipment</h2>
+      <div className="form-row">
+        <select value={shipmentId} onChange={(e) => setShipmentId(e.target.value)}>
+          <option value="">Shipment...</option>
+          {shipments.map((s) => (
+            <option key={s.id} value={s.id}>
+              #{s.id} {s.description} ({s.status})
+            </option>
+          ))}
+        </select>
+        <select value={vehicleId} onChange={(e) => setVehicleId(e.target.value)}>
+          <option value="">Vehicle...</option>
+          {vehicles.map((v) => (
+            <option key={v.id} value={v.id}>
+              {v.plate} ({v.vehicle_type}, {v.capacity_kg} kg)
+            </option>
+          ))}
+        </select>
+        <select value={driverId} onChange={(e) => setDriverId(e.target.value)}>
+          <option value="">Driver...</option>
+          {drivers.map((d) => (
+            <option key={d.id} value={d.id}>{d.full_name}</option>
+          ))}
+        </select>
+        <input
+          placeholder="Reason (optional)"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+        />
+        <button className="primary" onClick={submit}>Assign</button>
+      </div>
 
       {result && (
-        <div style={{ color: color[result.kind], marginTop: "8px" }}>
+        <div className={color[result.kind]} style={{ marginTop: 10 }}>
           <strong>{result.text}</strong>
           {result.violations && result.violations.length > 0 && (
-            <pre style={{ overflow: "auto" }}>
+            <pre>
               {JSON.stringify(result.violations, null, 2)}
             </pre>
           )}
