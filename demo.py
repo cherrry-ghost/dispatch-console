@@ -167,8 +167,8 @@ inc = b.get("id")
 check(s == 200, "incident reported by dispatcher")
 s, b = call("POST", f"/incidents/{inc}/verify")
 check(s == 200 and b.get("road_closed") is True, "manager verified -> ROAD CLOSED")
-tmp = os.path.join(tempfile.gettempdir(), "demo_evidence.txt")
-with open(tmp, "w") as f:
+fd, tmp = tempfile.mkstemp(suffix=".txt")
+with os.fdopen(fd, "w") as f:
     f.write("demo photo bytes")
 boundary = "demoboundary"
 with open(tmp, "rb") as f:
