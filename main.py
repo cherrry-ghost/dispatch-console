@@ -31,6 +31,8 @@ from psycopg.types.json import Jsonb
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from events import check_geofences, emit, hub
+from notifications import (notify, assigned_message, delivered_message,
+                           incident_message)
 
 app = FastAPI()
 app.add_middleware(
@@ -254,6 +256,21 @@ def list_events(kind: str | None = None, vehicle_id: int | None = None,
         ).fetchall()
 
 
+@app.get("/notifications")
+def list_notifications(shipment_id: int | None = None, limit: int = 100):
+    """The customer-message trail, newest first."""
+    limit = max(1, min(limit, 500))
+    where, params = "", []
+    if shipment_id is not None:
+        where = " WHERE shipment_id = %s"
+        params.append(shipment_id)
+    with get_connection() as conn:
+        return conn.execute(
+            f"SELECT * FROM notifications{where} "
+            "ORDER BY sent_at DESC, id DESC LIMIT %s",
+            (*params, limit)).fetchall()
+
+
 class VehicleIn(BaseModel):
     plate: str
     vehicle_type: str
@@ -399,6 +416,8 @@ class ShipmentIn(BaseModel):
     required_vehicle_type: str | None = None
     ready_minute: int = Field(default=0, ge=0, le=1440)
     deadline_minute: int | None = Field(default=None, ge=1, le=1440)
+    customer_name: str | None = None
+    customer_phone: str | None = None
 
 
 @app.get("/shipments")
@@ -408,7 +427,7 @@ def list_shipments():
             "SELECT id, description, weight_kg, is_hazardous, origin_id, "
             "destination_id, required_vehicle_type, status, created_at, "
             "delivered_at, eta_minutes, delay_minutes, "
-            "ready_minute, deadline_minute "
+            "ready_minute, deadline_minute, customer_name, customer_phone "
             "FROM shipments ORDER BY id"
         ).fetchall()
     return rows
@@ -431,8 +450,9 @@ def create_shipment(shipment: ShipmentIn):
             row = conn.execute(
                 "INSERT INTO shipments "
                 "(description, weight_kg, is_hazardous, origin_id, destination_id, "
-                "required_vehicle_type, ready_minute, deadline_minute) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "required_vehicle_type, ready_minute, deadline_minute, "
+                "customer_name, customer_phone) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "RETURNING id, status, created_at",
                 (
                     shipment.description,
@@ -443,6 +463,8 @@ def create_shipment(shipment: ShipmentIn):
                     shipment.required_vehicle_type,
                     shipment.ready_minute,
                     shipment.deadline_minute,
+                    shipment.customer_name,
+                    shipment.customer_phone,
                 ),
             ).fetchone()
     except psycopg.errors.ForeignKeyViolation:
@@ -559,6 +581,15 @@ async def create_assignment(assignment: AssignmentIn, response: Response):
                 vehicle_id=req["vehicle_id"], shipment_id=req["shipment_id"],
                 details={"driver_id": req["driver_id"]},
             )
+            shipment_row = conn.execute(
+                "SELECT id FROM shipments WHERE id = %s",
+                (req["shipment_id"],)).fetchone()
+            vehicle_row = conn.execute(
+                "SELECT plate FROM vehicles WHERE id = %s",
+                (req["vehicle_id"],)).fetchone()
+            note_event = notify(
+                conn, req["shipment_id"], "assigned",
+                assigned_message(shipment_row, vehicle_row["plate"]))
     except psycopg.errors.ForeignKeyViolation:
         raise HTTPException(
             status_code=400,
@@ -570,6 +601,7 @@ async def create_assignment(assignment: AssignmentIn, response: Response):
             detail="This shipment already has an active assignment",
         )
     await broadcast_event(created)
+    await broadcast_event(note_event)
     return {**row, **req, "warnings": []}
 
 
@@ -1047,6 +1079,51 @@ async def _save_delivery_proof(assignment_id, file: UploadFile | None):
     return path, digest
 
 
+@app.post("/driver/{driver_id}/jobs/{assignment_id}/incident")
+async def driver_report_incident(driver_id: int, assignment_id: int,
+                                 body: IncidentIn):
+    """A driver reports a road problem on an active job. The customer of
+    that shipment is told immediately (plain words, no blame)."""
+    if not body.description.strip():
+        raise HTTPException(status_code=422,
+                            detail="A short description is required")
+    with get_connection() as conn:
+        job = conn.execute(
+            "SELECT a.id, a.shipment_id FROM assignments a "
+            "WHERE a.id = %s AND a.driver_id = %s AND a.ended_at IS NULL",
+            (assignment_id, driver_id)).fetchone()
+        if job is None:
+            raise HTTPException(status_code=404,
+                                detail="No such active job for this driver")
+        row = conn.execute(
+            "INSERT INTO incidents (description, incident_type, road_edge_id, "
+            "reported_by) VALUES (%s, %s, %s, %s) RETURNING id, reported_at",
+            (body.description, body.incident_type, body.road_edge_id,
+             f"driver:{driver_id}")).fetchone()
+        append_audit(
+            conn, "driver", "incident.reported", "allowed",
+            actor_id=str(driver_id),
+            entity_type="incident", entity_id=str(row["id"]),
+            details={"description": body.description,
+                     "incident_type": body.incident_type,
+                     "road_edge_id": body.road_edge_id,
+                     "shipment_id": job["shipment_id"],
+                     "assignment_id": assignment_id},
+        )
+        event = emit(
+            conn, "incident.reported", "warning", shipment_id=job["shipment_id"],
+            details={"incident_id": row["id"],
+                     "incident_type": body.incident_type,
+                     "reported_by": f"driver:{driver_id}"})
+        note_event = notify(
+            conn, job["shipment_id"], "incident",
+            incident_message(job["shipment_id"], body.incident_type))
+    await broadcast_event(event)
+    await broadcast_event(note_event)
+    return {"incident_id": row["id"], "shipment_id": job["shipment_id"],
+            "status": "reported", "reported_at": row["reported_at"]}
+
+
 @app.post("/driver/{driver_id}/jobs/{assignment_id}/deliver")
 async def deliver_job(driver_id: int, assignment_id: int,
                       note: str = "", photo: UploadFile | None = None):
@@ -1084,6 +1161,8 @@ async def deliver_job(driver_id: int, assignment_id: int,
                      "delivered_at": delivered_at.isoformat(),
                      "proof": bool(proof_digest)},
         )
+        note_event = notify(conn, job["shipment_id"], "delivered",
+                            delivered_message(job["shipment_id"]))
         append_audit(
             conn, "driver", "delivery.confirmed", "allowed",
             actor_id=str(driver_id),
@@ -1094,6 +1173,7 @@ async def deliver_job(driver_id: int, assignment_id: int,
                      "photo_optional": True},
         )
     await broadcast_event(event)
+    await broadcast_event(note_event)
     return {"assignment_id": assignment_id,
             "shipment_id": job["shipment_id"],
             "delivered_at": delivered_at.isoformat(),

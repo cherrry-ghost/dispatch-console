@@ -488,8 +488,51 @@ except urllib.error.HTTPError as e:
 check(pwa_status == 200 and "Driver App" in pwa_html,
       "driver PWA served at /driver-app/ (installable, offline)")
 
-# 17 ─ audit ledger ---------------------------------------------------------
-section("17. Tamper-proof audit ledger")
+# 17 ─ customer notifications ------------------------------------------------
+section("17. Customer notifications + driver incident report")
+s, b = call("POST", "/shipments", {
+    "description": "Demo customer cargo", "weight_kg": 400,
+    "origin_id": locs[0]["id"], "destination_id": locs[1]["id"],
+    "customer_name": "Demo Retail Shop", "customer_phone": "+91 90000 42424"})
+if check(s == 200, "shipment created with a customer contact",
+         f"shipment #{b['id']} for Demo Retail Shop"):
+    demo_ship = b["id"]
+    combo_prop, combo_driver = saved_combo
+    # reuse the vehicle+driver pair that passed guardrails in step 4
+    s, b2 = call("POST", "/assignments", {
+        "shipment_id": demo_ship,
+        "vehicle_id": combo_prop["vehicle_id"],
+        "driver_id": combo_driver["id"],
+        "reason": "phase 8D demo"})
+    if check(s == 200, "shipment assigned to the customer's delivery",
+             f"job for vehicle {combo_prop['vehicle_id']}"):
+        s, notes = call("GET", f"/notifications?shipment_id={demo_ship}")
+        kinds = [n["kind"] for n in notes]
+        check("assigned" in kinds, "customer told it is on the way",
+              f'"{notes[0]["message"][:70]}"')
+        r = httpx.post(f"{BASE}/driver/{combo_driver['id']}/jobs/{b2['id']}/incident",
+                       json={"description": "Demo: rockslide blocks the ghat road",
+                             "incident_type": "road_blocked"})
+        check(r.status_code == 200,
+              "driver reported an incident from the PWA",
+              f"incident #{r.json().get('incident_id')}")
+        s, notes = call("GET", f"/notifications?shipment_id={demo_ship}")
+        kinds = [n["kind"] for n in notes]
+        check("incident" in kinds, "customer was told about the problem",
+              f'"{notes[0]["message"][:70]}..."')
+        r = httpx.post(f"{BASE}/driver/{combo_driver['id']}/jobs/{b2['id']}/deliver",
+                       data={"note": "demo delivery"})
+        check(r.status_code == 200, "delivery confirmed")
+        s, notes = call("GET", f"/notifications?shipment_id={demo_ship}")
+        kinds = [n["kind"] for n in notes]
+        check("delivered" in kinds and "incident" in kinds,
+              "customer got the full story: problem, then delivery",
+              f"kinds: {', '.join(reversed(kinds))}")
+    else:
+        ok("skip incident demo (assignment blocked)", str(b2)[:80])
+
+# 18 ─ audit ledger ---------------------------------------------------------
+section("18. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",
