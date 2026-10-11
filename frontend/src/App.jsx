@@ -10,6 +10,7 @@ import "leaflet/dist/leaflet.css";
 import AuditViewer from "./AuditViewer";
 import AssignmentForm from "./AssignmentForm";
 import ApprovalsPanel from "./ApprovalsPanel";
+import CopilotPanel from "./CopilotPanel";
 import EventsFeed from "./EventsFeed";
 import LiveVehicles from "./LiveVehicles";
 import NotificationsPanel from "./NotificationsPanel";
@@ -61,6 +62,8 @@ function App() {
     <div style={{ width: "min(950px, 95vw)", textAlign: "left" }}>
       <h1>Dispatch Console</h1>
       {error && <p>Could not load data: {error}</p>}
+
+      <CopilotPanel />
 
       <h2>Map</h2>
       <MapContainer

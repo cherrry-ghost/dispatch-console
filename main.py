@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from audit import append_audit, verify_chain
 import hashlib
+import json
 import os
 
 import networkx as nx
@@ -33,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from events import check_geofences, emit, hub
 from notifications import (notify, assigned_message, delivered_message,
                            incident_message)
+import copilot as copilot_engine
 
 app = FastAPI()
 app.add_middleware(
@@ -269,6 +271,142 @@ def list_notifications(shipment_id: int | None = None, limit: int = 100):
             f"SELECT * FROM notifications{where} "
             "ORDER BY sent_at DESC, id DESC LIMIT %s",
             (*params, limit)).fetchall()
+
+
+class CopilotAskIn(BaseModel):
+    question: str = Field(min_length=1)
+
+
+@app.post("/copilot/ask")
+def copilot_ask(body: CopilotAskIn):
+    """Ask the copilot. Informational intents answer directly; ACTION
+    intents become stored proposals - the copilot never executes."""
+    with get_connection() as conn:
+        result = copilot_engine.respond(
+            conn, body.question, {"model_health": _model_health})
+        proposal_id = None
+        if result["proposal"] is not None:
+            row = conn.execute(
+                "INSERT INTO copilot_proposals (question, intent, "
+                "confidence, answer, proposal, guardrail_results) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (body.question, result["intent"], result["confidence"],
+                 result["answer"], Jsonb(result["proposal"]),
+                 Jsonb(result["guardrail_results"])),
+            ).fetchone()
+            proposal_id = row["id"]
+        append_audit(
+            conn, "ai_copilot", "copilot.suggested", "allowed",
+            entity_type="copilot_proposal",
+            entity_id=str(proposal_id) if proposal_id else None,
+            details={"question": body.question,
+                     "intent": result["intent"],
+                     "confidence": result["confidence"],
+                     "answer": result["answer"],
+                     "proposal": result["proposal"],
+                     "guardrail_results": result["guardrail_results"],
+                     "alternatives": result["alternatives"]},
+        )
+    return {"proposal_id": proposal_id,
+            "requires_human": proposal_id is not None,
+            "model": "rule-based-intent-engine", "model_version": 1,
+            **result}
+
+
+@app.get("/copilot/proposals")
+def list_copilot_proposals(status: str | None = None, limit: int = 50):
+    """The Decision Ledger: every copilot suggestion and its human outcome."""
+    limit = max(1, min(limit, 200))
+    where, params = "", []
+    if status:
+        where = " WHERE status = %s"
+        params.append(status)
+    with get_connection() as conn:
+        return conn.execute(
+            f"SELECT * FROM copilot_proposals{where} "
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (*params, limit)).fetchall()
+
+
+class CopilotDecisionIn(BaseModel):
+    decision: Literal["accepted", "rejected"]
+    note: str | None = None
+
+
+@app.post("/copilot/proposals/{proposal_id}/decision")
+async def copilot_decide(proposal_id: int, body: CopilotDecisionIn):
+    """The human moment: accept runs the proposal through the SAME
+    guardrailed endpoints as a manual action - nothing is bypassed."""
+    with get_connection() as conn:
+        proposal = conn.execute(
+            "SELECT * FROM copilot_proposals WHERE id = %s",
+            (proposal_id,)).fetchone()
+        if proposal is None:
+            raise HTTPException(status_code=404,
+                                detail="Proposal not found")
+        if proposal["status"] != "proposed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"This proposal was already {proposal['status']}")
+        payload = proposal["proposal"]
+
+    outcome, result = "allowed", {}
+    try:
+        if body.decision == "rejected":
+            result = {"executed": False, "detail": "rejected by dispatcher"}
+        elif payload["action"] == "assign":
+            response = Response()
+            created = await create_assignment(AssignmentIn(
+                shipment_id=payload["shipment_id"],
+                vehicle_id=payload["vehicle_id"],
+                driver_id=payload["driver_id"],
+                reason=payload.get("reason") or "copilot proposal"),
+                response)
+            result = {"executed": True, "assignment": created}
+        elif payload["action"] == "road_status":
+            result = {"executed": True,
+                      "road": await set_road_status(
+                          payload["edge_id"],
+                          RoadStatusIn(status=payload["status"]))}
+        elif payload["action"] == "zone":
+            result = {"executed": True,
+                      "zone": create_zone(ZoneIn(
+                          name=payload["name"],
+                          center_lat=payload["center_lat"],
+                          center_lng=payload["center_lng"],
+                          radius_km=payload["radius_km"],
+                          zone_type=payload["zone_type"]))}
+        else:
+            outcome, result = "blocked", {"error": "unknown action"}
+    except HTTPException as exc:
+        outcome = "blocked"
+        result = {"executed": False, "detail": exc.detail}
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE copilot_proposals SET status = %s, decided_by = %s, "
+            "decision_note = %s, decided_at = now() WHERE id = %s",
+            (body.decision, "dispatcher", body.note, proposal_id))
+        append_audit(
+            conn, "dispatcher",
+            "copilot.accepted" if body.decision == "accepted"
+            else "copilot.rejected",
+            outcome, actor_id="dispatcher",
+            entity_type="copilot_proposal", entity_id=str(proposal_id),
+            details={"intent": proposal["intent"],
+                     "proposal": payload, "note": body.note,
+                     "result": result},
+        )
+        safe_result = json.loads(json.dumps(result, default=str))
+        event = emit(
+            conn, f"copilot.{body.decision}",
+            "info" if outcome == "allowed" else "warning",
+            details={"proposal_id": proposal_id,
+                     "intent": proposal["intent"],
+                     "result": safe_result})
+    await broadcast_event(event)
+    return {"proposal_id": proposal_id, "decision": body.decision,
+            "outcome": outcome, "result": result}
 
 
 class VehicleIn(BaseModel):
