@@ -4,8 +4,8 @@ const WS_URL = "ws://localhost:8010/ws/events";
 const API_URL = "http://localhost:8010";
 
 const SEVERITY_COLOR = {
-  info: "#374151",
-  warning: "#b45309",
+  info: "#8ba0bf",
+  warning: "#fbbf24",
 };
 
 // Live event feed: geofence crossings, road closures, assignment milestones.
@@ -64,16 +64,16 @@ function EventsFeed() {
     <div>
       <h2>
         Events{" "}
-        <small style={{ color: connected ? "#16a34a" : "#b91c1c" }}>
-          {connected ? "(live)" : "(offline)"}
+        <small className={`live-dot ${connected ? "on" : "off"}`}>
+          {connected ? "● LIVE" : "● OFFLINE"}
         </small>
       </h2>
       {events.length === 0 && <p>No events yet.</p>}
       {events.length > 0 && (
-        <ul ref={listRef} style={{ maxHeight: "260px", overflowY: "auto" }}>
+        <ul ref={listRef} className="feed">
           {events.map((e) => (
             <li key={e.id ?? `${e.kind}-${e.created_at}`}>
-              <span style={{ color: SEVERITY_COLOR[e.severity] || "#374151" }}>
+              <span style={{ color: SEVERITY_COLOR[e.severity] || "#8ba0bf" }}>
                 {describe(e)}
               </span>{" "}
               <small>({new Date(e.created_at).toLocaleTimeString()})</small>

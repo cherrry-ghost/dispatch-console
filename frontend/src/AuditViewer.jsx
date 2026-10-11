@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 
 const API_URL = "http://localhost:8010";
-const OUTCOME_COLOR = { allowed: "#16a34a", blocked: "#dc2626", warning: "#ca8a04" };
+const OUTCOME_CLASS = {
+  allowed: "badge badge-ok",
+  blocked: "badge badge-danger",
+  warning: "badge badge-warn",
+};
 
 export default function AuditViewer({ refreshKey }) {
   const [rows, setRows] = useState([]);
@@ -33,7 +37,7 @@ export default function AuditViewer({ refreshKey }) {
       <button onClick={load}>Refresh</button>{" "}
       <button onClick={runVerify}>Verify chain</button>
       {verify && (
-        <p style={{ color: verify.ok ? "#16a34a" : "#dc2626" }}>
+        <p className={verify.ok ? "text-ok" : "text-danger"}>
           {verify.ok
             ? `Chain intact (${verify.checked} entries checked)`
             : `CHAIN BROKEN at entry #${verify.broken_at_id}: ${verify.reason}`}
@@ -55,8 +59,10 @@ export default function AuditViewer({ refreshKey }) {
               <td>{r.actor_type}{r.actor_id ? ` (${r.actor_id})` : ""}</td>
               <td>{r.action}</td>
               <td>{r.entity_type} {r.entity_id}</td>
-              <td style={{ color: OUTCOME_COLOR[r.outcome], fontWeight: "bold" }}>
-                {r.outcome}
+              <td>
+                <span className={OUTCOME_CLASS[r.outcome] || "badge badge-muted"}>
+                  {r.outcome}
+                </span>
               </td>
               <td>
                 <details>

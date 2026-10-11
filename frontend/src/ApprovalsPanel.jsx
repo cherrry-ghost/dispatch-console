@@ -43,26 +43,32 @@ export default function ApprovalsPanel({ refreshKey, onDone }) {
   return (
     <div>
       <h2>Approvals</h2>
-      {message && <p><strong>{message}</strong></p>}
+      {message && <p><strong className="text-warn">{message}</strong></p>}
       {pending.length === 0 && <p>Nothing waiting for approval.</p>}
       {pending.map((a) => (
-        <div key={a.id} style={{ border: "1px solid #888", padding: "8px", marginBottom: "8px" }}>
+        <div key={a.id} className="item-box">
           <div>
             <strong>#{a.id}</strong> {a.action} for shipment {a.entity_id}
             {" "}(vehicle {a.request.vehicle_id}, driver {a.request.driver_id})
           </div>
           <ul>
             {a.warnings.map((w, i) => (
-              <li key={i} style={{ color: "#ca8a04" }}>{w.message}</li>
+              <li key={i} className="text-warn">{w.message}</li>
             ))}
           </ul>
-          <input
-            placeholder="Note (optional)"
-            value={notes[a.id] || ""}
-            onChange={(e) => setNotes({ ...notes, [a.id]: e.target.value })}
-          />{" "}
-          <button onClick={() => decide(a.id, "approved")}>Approve</button>{" "}
-          <button onClick={() => decide(a.id, "rejected")}>Reject</button>
+          <div className="form-row">
+            <input
+              placeholder="Note (optional)"
+              value={notes[a.id] || ""}
+              onChange={(e) => setNotes({ ...notes, [a.id]: e.target.value })}
+            />
+            <button className="primary" onClick={() => decide(a.id, "approved")}>
+              Approve
+            </button>
+            <button className="danger" onClick={() => decide(a.id, "rejected")}>
+              Reject
+            </button>
+          </div>
         </div>
       ))}
       {decided.length > 0 && (

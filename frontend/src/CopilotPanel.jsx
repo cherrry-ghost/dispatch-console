@@ -77,33 +77,32 @@ function CopilotPanel() {
   return (
     <div>
       <h2>AI copilot <small>(proposes — you decide)</small></h2>
-      <div style={{ background: "#f9fafb", borderRadius: 8, padding: 12,
-                    maxHeight: 340, overflowY: "auto" }}>
+      <div className="chat">
         {messages.length === 0 && (
-          <p style={{ color: "#6b7280" }}>Ask me about the fleet, shipments,
-            the model, or ask me to propose an action.</p>
+          <p style={{ color: "#5f7495", margin: 0 }}>Ask me about the fleet,
+            shipments, the model, or ask me to propose an action.</p>
         )}
         {messages.map((m, i) => (
-          <div key={i} style={{ margin: "8px 0" }}>
-            <b>{m.role === "you" ? "You" : "Copilot"}:</b> {m.text}
+          <div key={i} className={`msg ${m.role === "you" ? "you" : ""}`}>
+            <span className="who">{m.role === "you" ? "You" : "Copilot"}:</span>
+            {m.text}
             {m.intent && (
-              <div style={{ fontSize: 12, color: "#6b7280" }}>
+              <div className="meta">
                 intent: {m.intent} · confidence {m.confidence}
               </div>
             )}
             {m.proposal && (
-              <div style={{ border: "1px solid #f59e0b", borderRadius: 6,
-                            padding: 8, marginTop: 6, background: "#fffbeb" }}>
-                <div style={{ fontSize: 13 }}>
+              <div className="proposal">
+                <div>
                   Proposal <code>{JSON.stringify(m.proposal)}</code>
                 </div>
                 {(m.guardrails?.length ?? 0) > 0 && (
-                  <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>
+                  <div className="meta">
                     guardrails: {m.guardrails.map(
                       (g) => `${g.rule}:${g.severity}`).join(", ") || "none"}
                   </div>
                 )}
-                <button disabled={busy} style={{ marginRight: 6 }}
+                <button disabled={busy} className="primary"
                         onClick={() => decide(m.proposalId, "accepted")}>
                   Accept
                 </button>
@@ -117,21 +116,21 @@ function CopilotPanel() {
         ))}
         <div ref={listEnd} />
       </div>
-      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+      <div className="chat-input">
         <input
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
           placeholder="e.g. propose a plan for today"
-          style={{ flex: 1, padding: 8 }}
         />
-        <button disabled={busy} onClick={() => send()}>Ask</button>
+        <button disabled={busy} className="primary" onClick={() => send()}>
+          Ask
+        </button>
       </div>
-      <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap",
-                    gap: 6 }}>
+      <div className="chips">
         {SUGGESTIONS.map((s) => (
-          <button key={s} disabled={busy} onClick={() => send(s)}
-                  style={{ fontSize: 12, padding: "4px 8px" }}>
+          <button key={s} disabled={busy} className="chip"
+                  onClick={() => send(s)}>
             {s}
           </button>
         ))}

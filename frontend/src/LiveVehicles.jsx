@@ -61,8 +61,8 @@ function LiveVehicles({ onZoneAlert }) {
     <div>
       <h2>
         Live tracking{" "}
-        <small style={{ color: connected ? "#16a34a" : "#b91c1c" }}>
-          {connected ? "(live)" : "(offline)"}
+        <small className={`live-dot ${connected ? "on" : "off"}`}>
+          {connected ? "● LIVE" : "● OFFLINE"}
         </small>
       </h2>
       {entries.length === 0 && <p>No vehicle positions yet.</p>}
@@ -76,7 +76,7 @@ function LiveVehicles({ onZoneAlert }) {
           </thead>
           <tbody>
             {entries.map(([id, p]) => (
-              <tr key={id} style={p.alert ? { background: "#fee2e2" } : {}}>
+              <tr key={id} className={p.alert ? "row-alert" : ""}>
                 <td>#{id}</td>
                 <td>{p.lat.toFixed(4)}</td>
                 <td>{p.lng.toFixed(4)}</td>
@@ -84,8 +84,8 @@ function LiveVehicles({ onZoneAlert }) {
                 <td>{p.source}</td>
                 <td>
                   {p.alert
-                    ? `⚠ ${p.alert.zone_name}`
-                    : "ok"}
+                    ? <span className="badge badge-danger">⚠ {p.alert.zone_name}</span>
+                    : <span className="badge badge-muted">ok</span>}
                 </td>
               </tr>
             ))}

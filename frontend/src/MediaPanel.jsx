@@ -2,11 +2,11 @@ import { useEffect, useState } from "react";
 
 const API_URL = "http://localhost:8010";
 
-const VERDICT_STYLE = {
-  clean: { color: "#166534", bg: "#dcfce7" },
-  suspicious: { color: "#92400e", bg: "#fef3c7" },
-  likely_fake: { color: "#991b1b", bg: "#fee2e2" },
-  unverified: { color: "#374151", bg: "#e5e7eb" },
+const VERDICT_CLASS = {
+  clean: "badge v-clean",
+  suspicious: "badge v-suspicious",
+  likely_fake: "badge v-likely_fake",
+  unverified: "badge v-unverified",
 };
 
 // Phase 11: what the media checker thinks about uploaded photos/videos.
@@ -28,7 +28,7 @@ function MediaPanel() {
       <h2>
         Media authenticity{" "}
         <small>(automatic checks — a human still decides)</small>
-        <button onClick={load} style={{ marginLeft: 8, fontSize: 12 }}>
+        <button onClick={load} className="chip" style={{ marginLeft: 8 }}>
           Refresh
         </button>
       </h2>
@@ -46,20 +46,14 @@ function MediaPanel() {
           </thead>
           <tbody>
             {checks.map((c) => {
-              const style = VERDICT_STYLE[c.verdict] || {};
+              const cls = VERDICT_CLASS[c.verdict] || "badge v-unverified";
               const flags = (c.reasons || [])
                 .filter((r) => r.severity !== "info")
                 .map((r) => r.flag);
               return (
                 <tr key={c.id}>
                   <td>
-                    <span
-                      style={{
-                        background: style.bg, color: style.color,
-                        padding: "2px 10px", borderRadius: 999,
-                        fontWeight: 600, fontSize: 13,
-                      }}
-                    >
+                    <span className={cls}>
                       {c.verdict}
                     </span>
                   </td>
@@ -71,10 +65,10 @@ function MediaPanel() {
                   <td style={{ fontFamily: "monospace", fontSize: 12 }}>
                     {c.filename}
                   </td>
-                  <td style={{ fontSize: 12, color: "#6b7280" }}>
+                  <td style={{ fontSize: 12, color: "#8ba0bf" }}>
                     {flags.length ? flags.join(", ") : "none"}
                   </td>
-                  <td style={{ fontSize: 12, color: "#6b7280" }}>
+                  <td style={{ fontSize: 12, color: "#8ba0bf" }}>
                     {String(c.checked_at).slice(0, 16).replace("T", " ")}
                   </td>
                 </tr>

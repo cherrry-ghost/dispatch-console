@@ -47,22 +47,20 @@ function LoginBar() {
 
   if (token) {
     return (
-      <p style={{ margin: "4px 0" }}>
-        Logged in as <b>{username}</b>{" "}
-        <button onClick={logout} style={{ marginLeft: 8 }}>Log out</button>
-      </p>
+      <div className="login">
+        <span className="who">Signed in as <b>{username}</b></span>
+        <button onClick={logout}>Log out</button>
+      </div>
     );
   }
   return (
-    <form onSubmit={login} style={{ margin: "8px 0", display: "flex",
-                                     gap: 6, alignItems: "center" }}>
-      <b>Sign in</b>
+    <form onSubmit={login} className="login">
       <input value={user} onChange={(e) => setUser(e.target.value)}
-             placeholder="username" size={10} />
+             placeholder="username" />
       <input value={password} onChange={(e) => setPassword(e.target.value)}
-             placeholder="password" type="password" size={10} />
-      <button type="submit">Log in</button>
-      {message && <span style={{ color: "#b91c1c" }}>{message}</span>}
+             placeholder="password" type="password" />
+      <button type="submit" className="primary">Log in</button>
+      {message && <span className="login-msg">{message}</span>}
     </form>
   );
 }
