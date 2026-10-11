@@ -36,6 +36,7 @@ from events import check_geofences, emit, hub
 from notifications import (notify, assigned_message, delivered_message,
                            incident_message)
 import copilot as copilot_engine
+import media as media_engine
 
 app = FastAPI()
 app.add_middleware(
@@ -1470,6 +1471,28 @@ async def deliver_job(driver_id: int, assignment_id: int,
             "WHERE id = %s",
             (delivered_at, delivered_at, note or None, proof_path,
              proof_digest, assignment_id))
+        proof_report = None
+        if proof_path and proof_digest:
+            proof_report = media_engine.check_media(
+                conn, "delivery", assignment_id, proof_path, proof_digest,
+                os.path.basename(proof_path))
+            append_audit(
+                conn, "ai_media_checker", "media.analyzed",
+                "allowed" if proof_report["verdict"] == "clean"
+                else "warning",
+                entity_type="media", entity_id=f"delivery:{assignment_id}",
+                details={"verdict": proof_report["verdict"],
+                         "score": proof_report["score"],
+                         "flags": [r["flag"] for r in
+                                   proof_report["reasons"]]})
+            event = emit(
+                conn, "media.analyzed",
+                "info" if proof_report["verdict"] == "clean" else "warning",
+                details={"media_kind": "delivery",
+                         "ref_id": assignment_id,
+                         "verdict": proof_report["verdict"],
+                         "score": proof_report["score"]})
+            await broadcast_event(event)
         event = emit(
             conn, "assignment.completed", "info",
             vehicle_id=None, shipment_id=job["shipment_id"],
@@ -1493,7 +1516,8 @@ async def deliver_job(driver_id: int, assignment_id: int,
     return {"assignment_id": assignment_id,
             "shipment_id": job["shipment_id"],
             "delivered_at": delivered_at.isoformat(),
-            "proof_recorded": bool(proof_digest)}
+            "proof_recorded": bool(proof_digest),
+            "proof_check": proof_report}
 
 
 @app.post("/incidents/{incident_id}/evidence")
@@ -1534,11 +1558,105 @@ async def attach_evidence(incident_id: int, file: UploadFile,
                      "content_type": file.content_type},
         )
     os.makedirs(EVIDENCE_DIR, exist_ok=True)
-    with open(os.path.join(EVIDENCE_DIR, f"{digest}_{safe_name}"), "wb") as f:
+    file_path = os.path.join(EVIDENCE_DIR, f"{digest}_{safe_name}")
+    with open(file_path, "wb") as f:
         f.write(content)
+    # Phase 11: analyse the upload immediately and store the verdict
+    with get_connection() as conn:
+        report = media_engine.check_media(
+            conn, "evidence", row["id"], file_path, digest, safe_name)
+        append_audit(
+            conn, "ai_media_checker", "media.analyzed",
+            "allowed" if report["verdict"] == "clean" else "warning",
+            entity_type="media", entity_id=f"evidence:{row['id']}",
+            details={"verdict": report["verdict"], "score": report["score"],
+                     "flags": [r["flag"] for r in report["reasons"]]})
+        event = emit(
+            conn, "media.analyzed",
+            "info" if report["verdict"] == "clean" else "warning",
+            details={"media_kind": "evidence", "ref_id": row["id"],
+                     "verdict": report["verdict"],
+                     "score": report["score"]})
+    await broadcast_event(event)
     return {"id": row["id"], "incident_id": incident_id,
             "filename": safe_name, "size_bytes": len(content),
-            "sha256": digest, "uploaded_at": row["uploaded_at"]}
+            "sha256": digest, "uploaded_at": row["uploaded_at"],
+            "media_check": report}
+
+
+# ------------------------------------------------- media authenticity
+
+@app.get("/media/checks")
+def list_media_checks(limit: int = 25):
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT id, media_kind, ref_id, filename, sha256, verdict, "
+            "score, reasons, checked_by, checked_at FROM media_checks "
+            "ORDER BY id DESC LIMIT %s", (max(1, min(limit, 100)),),
+        ).fetchall()
+
+
+@app.get("/media/checks/evidence/{ref_id}")
+def latest_evidence_check(ref_id: int):
+    with get_connection() as conn:
+        report = media_engine.latest_check(conn, "evidence", ref_id)
+    if report is None:
+        raise HTTPException(status_code=404,
+                            detail="No media check for this evidence yet")
+    return report
+
+
+@app.get("/media/checks/delivery/{ref_id}")
+def latest_delivery_check(ref_id: int):
+    with get_connection() as conn:
+        report = media_engine.latest_check(conn, "delivery", ref_id)
+    if report is None:
+        raise HTTPException(status_code=404,
+                            detail="No media check for this delivery yet")
+    return report
+
+
+@app.post("/media/check/{media_kind}/{ref_id}")
+def recheck_media(media_kind: str, ref_id: int,
+                  user: dict = Depends(require_roles("dispatcher",
+                                                     "manager"))):
+    """Re-run the authenticity analysis on an already stored file - for
+    example after a manager asks for a second look."""
+    if media_kind not in ("evidence", "delivery"):
+        raise HTTPException(status_code=404, detail="Unknown media kind")
+    with get_connection() as conn:
+        if media_kind == "evidence":
+            row = conn.execute(
+                "SELECT id, sha256, filename FROM incident_evidence "
+                "WHERE id = %s", (ref_id,)).fetchone()
+            path = None if row is None else os.path.join(
+                EVIDENCE_DIR,
+                f"{row['sha256']}_{os.path.basename(row['filename'] or '')}")
+        else:
+            row = conn.execute(
+                "SELECT id, proof_sha256 AS sha256, proof_path AS filename "
+                "FROM assignments WHERE id = %s AND proof_path IS NOT NULL",
+                (ref_id,)).fetchone()
+            path = row["filename"] if row else None
+        if row is None or not row["sha256"] or not path:
+            raise HTTPException(status_code=404,
+                                detail="No stored media for this reference")
+        try:
+            report = media_engine.check_media(
+                conn, media_kind, ref_id, path, row["sha256"],
+                os.path.basename(path))
+        except FileNotFoundError:
+            raise HTTPException(status_code=410,
+                                detail="The stored file is missing on disk")
+        append_audit(
+            conn, "ai_media_checker", "media.analyzed",
+            "allowed" if report["verdict"] == "clean" else "warning",
+            entity_type="media",
+            entity_id=f"{media_kind}:{ref_id}",
+            details={"verdict": report["verdict"], "score": report["score"],
+                     "flags": [r["flag"] for r in report["reasons"]],
+                     "rechecked_by": user["username"]})
+    return report
 
 
 @app.get("/incidents/{incident_id}")

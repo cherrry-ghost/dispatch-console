@@ -14,6 +14,7 @@ import CopilotPanel from "./CopilotPanel";
 import EventsFeed from "./EventsFeed";
 import LoginBar from "./LoginBar";
 import LiveVehicles from "./LiveVehicles";
+import MediaPanel from "./MediaPanel";
 import NotificationsPanel from "./NotificationsPanel";
 
 const API_URL = "http://localhost:8010";
@@ -133,6 +134,7 @@ function App() {
       />
       <EventsFeed />
       <NotificationsPanel />
+      <MediaPanel />
 
       <AssignmentForm
         shipments={shipments}
