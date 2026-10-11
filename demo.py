@@ -66,6 +66,22 @@ section("1. Server health")
 s, b = call("GET", "/health")
 check(s == 200 and b.get("status") == "ok", "server is alive")
 
+# 1b ─ clean up leftovers from earlier demo runs ---------------------------
+s, zones_all = call("GET", "/zones")
+s, edges_all = call("GET", "/road-edges")
+leftovers = 0
+for z in zones_all:
+    if z.get("active"):
+        call("POST", f"/zones/{z['id']}/status", {"active": False})
+        leftovers += 1
+for e in edges_all:
+    if e["status"] == "closed":
+        call("POST", f"/road-edges/{e['id']}/status", {"status": "open"})
+        leftovers += 1
+if leftovers:
+    print(f"  ..   reset {leftovers} leftover zone(s)/closure(s) "
+          "from earlier runs")
+
 # 2 ─ generate a synthetic world ------------------------------------------
 section("2. Generate a synthetic world (data generator)")
 s, b = call("POST", "/datagen", {"scale": "medium", "seed": rng.randint(1, 9999),
@@ -104,27 +120,35 @@ check(b.get("plan_id") is not None, "plan has an id",
 
 # 4 ─ accept one proposal through the guardrails ---------------------------
 section("4. Guardrails + manager approval (assign a shipment)")
-shipment, vehicle = props[0]["shipment_id"], props[0]["vehicle_id"]
-driver = drivers[0]["id"]
-s, b = call("POST", "/assignments", {"shipment_id": shipment,
-                                     "vehicle_id": vehicle,
-                                     "driver_id": driver,
-                                     "reason": "planner proposal"})
-if s == 200:
+saved_combo, last_detail = None, ""
+for driver in drivers:
+    for prop in props[:5]:
+        s, b = call("POST", "/assignments",
+                    {"shipment_id": prop["shipment_id"],
+                     "vehicle_id": prop["vehicle_id"],
+                     "driver_id": driver["id"],
+                     "reason": "planner proposal"})
+        if s in (200, 202):
+            saved_combo = (prop, driver)
+            break
+        last_detail = str(b.get("detail"))[:100]
+    if saved_combo:
+        break
+if saved_combo is None:
+    ok("guardrail BLOCKED every driver combo (hard rules)",
+       last_detail)
+elif s == 200:
     ok("assignment accepted immediately", "no warnings fired")
-elif s == 202:
+else:
     ap = b.get("approval_id")
     ok("guardrail raised a warning, manager sign-off needed")
     s2, pend = call("GET", "/approvals?status=pending")
     s3, d = call("POST", f"/approvals/{ap}/decision",
                  {"decision": "approved", "note": "demo approval"})
     check(s3 == 200, "manager approved the flagged assignment")
-else:
-    v = b.get("detail")
-    ok("guardrail BLOCKED the combo (hard rule broken)",
-       str(v)[:100])
 s, after = call("GET", "/assignments")
-check(len(after) > len(before), "assignment saved in the database")
+if saved_combo:
+    check(len(after) > len(before), "assignment saved in the database")
 
 # 5 ─ forbidden zone -------------------------------------------------------
 section("5. Forbidden zone (war zone stops roads)")
@@ -248,8 +272,48 @@ if check(s == 200, "model trained on completed history",
     check(untouched["delay_minutes"] is None,
           "model only advises - shipment untouched")
 
-# 11 ─ audit ledger --------------------------------------------------------
-section("11. Tamper-proof audit ledger")
+# 11 ─ contingency playbook -------------------------------------------------
+section("11. Stress scenario + contingency playbook")
+edge = next(e for e in edges if e["status"] == "open")
+victim = locs[0]
+s, scen = call("POST", "/simulate/scenario", {"actions": [
+    {"kind": "close_road", "edge_id": edge["id"]},
+    {"kind": "add_zone", "zone": {"name": "Demo stress zone",
+                                  "center_lat": victim["latitude"],
+                                  "center_lng": victim["longitude"],
+                                  "radius_km": 40}},
+]})
+if check(s == 200, "multi-failure scenario simulated on copies",
+         ", ".join(f"{k}: {v}" for k, v in scen.get("summary", {}).items())):
+    net = scen.get("network", {})
+    ok("network health measured",
+       f"roads closed: {net.get('roads_closed_by_scenario')}, "
+       f"largest connected share: {net.get('largest_connected_share')}")
+s, pb = call("POST", "/playbooks", {
+    "name": f"Demo playbook {rng.randint(1, 99999)}",
+    "description": "Close a road and fence off a city - tested response",
+    "actions": scen["actions"] if s == 200 else [],
+})
+if check(s == 200, "playbook saved with its tested impact"):
+    s2, ap = call("POST", f"/playbooks/{pb['id']}/apply")
+    check(s2 == 200 and ap.get("applied"),
+          "playbook applied FOR REAL",
+          f"{len(ap.get('applied', []))} changes made")
+    s3, e2 = call("GET", "/road-edges")
+    now_closed = next((e for e in e2 if e["id"] == edge["id"]), None)
+    check(now_closed and now_closed["status"] == "closed",
+          "the road really is closed in the database")
+    # a demo must clean up after itself: undo the real changes
+    for a in ap.get("applied", []):
+        if a["kind"] == "add_zone":
+            call("POST", f"/zones/{a['zone_id']}/status", {"active": False})
+        elif a["kind"] == "close_road":
+            call("POST", f"/road-edges/{a['edge_id']}/status",
+                 {"status": "open"})
+    ok("cleaned up (zone off, road reopened)")
+
+# 12 ─ audit ledger ---------------------------------------------------------
+section("12. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",
