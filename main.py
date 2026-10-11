@@ -17,12 +17,13 @@ from planner import plan_shipments
 from zones import split_edges_by_zones
 from validator import validate_route
 from datagen import generate_world
+from anomalies import scan as scan_anomalies
 from delay_model import (
     FEATURES, MIN_HISTORY_FOR_TRAINING, MODEL_VERSION,
     explain as explain_delay, interval_coverage, load as load_model,
     mean_absolute_error as delay_model_mae, model_exists,
-    predict as predict_delay, route_features, save as save_delay_model,
-    train as train_delay_model, travel_minutes,
+    predict as predict_delay, predict_median, route_features,
+    save as save_delay_model, train as train_delay_model, travel_minutes,
 )
 from typing import Literal
 from psycopg.types.json import Jsonb
@@ -1555,10 +1556,42 @@ def predict_eta(body: PredictIn):
             "model": {"name": "xgboost", "version": MODEL_VERSION}}
 
 
+@app.get("/anomalies")
+def list_anomalies():
+    """Scan completed trips for delays that defy expectations, physically
+    impossible travel times and contradictory records."""
+    with get_connection() as conn:
+        completed = conn.execute(
+            "SELECT * FROM shipments WHERE status = 'completed' ORDER BY id"
+        ).fetchall()
+        edges = conn.execute("SELECT * FROM road_edges").fetchall()
+    has_model = model_exists()
+    models = load_model() if has_model else None
+    predict_fn = (lambda f: predict_median(models, f)) if has_model else None
+    features_by_id = {}
+    for s in completed:
+        route = shortest_route(edges, s["origin_id"], s["destination_id"])
+        features_by_id[s["id"]] = route_features(route, s) if route else None
+    findings = scan_anomalies(completed, features_by_id,
+                              predict_fn=predict_fn)
+    summary = {
+        "checked": len(completed),
+        "flagged": len(findings),
+        "high": sum(1 for f in findings if f["severity"] == "high"),
+        "medium": sum(1 for f in findings if f["severity"] == "medium"),
+        "delay_check": "model" if has_model else "statistics",
+    }
+    with get_connection() as conn:
+        append_audit(
+            conn, "system", "anomaly.scan", "allowed",
+            entity_type="anomaly_scan", entity_id=uuid4().hex[:12],
+            details=summary,
+        )
+    return {"summary": summary, "anomalies": findings}
+
+
 class PlannerRequest(BaseModel):
     shipment_ids: list[int] | None = None  # None = all pending shipments
-
-
 @app.post("/planner/propose")
 def propose_plan(body: PlannerRequest):
     with get_connection() as conn:
