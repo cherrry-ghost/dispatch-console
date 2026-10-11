@@ -37,7 +37,7 @@ def test_same_seed_builds_same_world(client):
     # a fresh empty database gives the identical second world
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute(
-            "TRUNCATE audit_log, approvals, copilot_proposals, "
+            "TRUNCATE audit_log, approvals, copilot_proposals, media_checks, "
             "incident_evidence, incidents, notifications, events, zones, "
             "vehicle_positions, road_edges, assignments, shipments, "
             "drivers, vehicles, locations RESTART IDENTITY")

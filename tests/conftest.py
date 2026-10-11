@@ -30,7 +30,7 @@ def clean_database():
     """Empty every table before each test so each one starts from a blank slate."""
     with psycopg.connect(_TEST_DB_URL) as conn:
         conn.execute(
-           "TRUNCATE audit_log, approvals, copilot_proposals, incident_evidence, incidents, zones, playbooks, notifications, events, vehicle_positions, road_edges, assignments, shipments, drivers, vehicles, locations, users "
+           "TRUNCATE audit_log, approvals, copilot_proposals, media_checks, incident_evidence, incidents, zones, playbooks, notifications, events, vehicle_positions, road_edges, assignments, shipments, drivers, vehicles, locations, users "
             "RESTART IDENTITY"
         )
         # the login fixtures need the seeded users; truncating users keeps

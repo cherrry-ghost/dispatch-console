@@ -338,11 +338,62 @@ def _help(extra="", intent=None):
             "answer": (extra + " " if extra else "")
             + "I can summarize the fleet or pending shipments, draft a "
             "plan ('propose a plan'), predict delay ('predict delay for "
-            "shipment 12'), report model health or anomalies, and PROPOSE "
-            "actions ('assign shipment 3 to vehicle 5', 'close road 42', "
-            "'add forbidden zone at lat 13.0 lng 80.0 radius 5'). I never "
-            "execute - you accept or reject.",
+            "shipment 12'), report model health or anomalies, check "
+            "evidence ('is the proof for incident 3 authentic?'), and "
+            "PROPOSE actions ('assign shipment 3 to vehicle 5', 'close "
+            "road 42', 'add forbidden zone at lat 13.0 lng 80.0 radius "
+            "5'). I never execute - you accept or reject.",
             "proposal": None, "guardrail_results": [], "alternatives": []}
+
+
+def _intent_media(conn, q, ctx):
+    """Report the stored authenticity verdict for evidence or a proof."""
+    m = re.search(r"incident\s*#?(\d+)", q)
+    kind, ref = "evidence", int(m.group(1)) if m else None
+    if ref is None:
+        m = re.search(r"(deliver\w*|assignment|job)\s*#?(\d+)", q)
+        if m:
+            kind, ref = "delivery", int(m.group(2))
+    if ref is None:
+        return _help("Tell me which item: 'is the proof for incident 3 "
+                     "authentic?' or 'check the photo for delivery 7'.",
+                     intent="media_check")
+    if kind == "evidence":
+        row = conn.execute(
+            "SELECT c.verdict, c.score, c.reasons, c.checked_at "
+            "FROM media_checks c JOIN incident_evidence e "
+            "ON e.id = c.ref_id WHERE c.media_kind = 'evidence' "
+            "AND e.incident_id = %s ORDER BY c.id DESC LIMIT 1",
+            (ref,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT verdict, score, reasons, checked_at FROM media_checks "
+            "WHERE media_kind = 'delivery' AND ref_id = %s "
+            "ORDER BY id DESC LIMIT 1", (ref,)).fetchone()
+    if row is None:
+        return {"intent": "media_check",
+                "answer": f"No media was ever uploaded for {kind} #{ref}, "
+                          "so there is nothing to verify.",
+                "proposal": None, "guardrail_results": [],
+                "alternatives": []}
+    flags = [r.get("flag") for r in (row["reasons"] or [])
+             if r.get("severity") in ("medium", "high", "block")]
+    verdict_text = {
+        "clean": "no red flags found",
+        "suspicious": "suspicious: it has warning signs, ask for a "
+                      "second photo before relying on it",
+        "likely_fake": "LIKELY FAKE: do not treat it as proof",
+        "unverified": "unverified: the file is intact but its contents "
+                      "could not be analysed",
+    }[row["verdict"]]
+    return {"intent": "media_check",
+            "answer": (f"Media check for {kind} #{ref}: "
+                       f"{row['verdict'].upper()} (trust {row['score']}/100) "
+                       f"- {verdict_text}."
+                       + (f" Signals: {', '.join(flags)}." if flags else ""))
+            + " The final call stays with a human.",
+            "proposal": None, "guardrail_results": [],
+            "alternatives": []}
 
 
 INTENTS = [
@@ -352,6 +403,8 @@ INTENTS = [
     (r"model health|drift|trust of (the )?model|is the model",
      intent_model_health),
     (r"anomal|suspicious|weird trips", intent_anomalies),
+    (r"authentic|\bfake\b|\breal\b|media check|proof for|is the (photo|"
+     r"proof|evidence|video)", _intent_media),
     (r"assign", intent_assign),
     (r"close road|reopen road|unblock road|\bopen road\b", intent_road),
     (r"(add|create).{0,10}zone|forbidden zone|geofence", intent_zone),

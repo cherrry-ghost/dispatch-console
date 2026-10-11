@@ -105,7 +105,8 @@ def test_deliver_with_photo_records_hash(client, driver_login):
               if a["action"] == "delivery.confirmed"]
     assert audits[0]["details"]["proof_sha256"] == digest
     stored = [f for f in os.listdir(EVIDENCE_DIR)
-              if f.startswith(f"delivery_{assignment_id}_")]
+              if f.startswith(f"delivery_{assignment_id}_")
+              and f.endswith(".png") and digest[:12] in f]
     assert len(stored) == 1
     with open(os.path.join(EVIDENCE_DIR, stored[0]), "rb") as f:
         assert hashlib.sha256(f.read()).hexdigest() == digest
