@@ -455,8 +455,41 @@ s, feed = call("GET", "/events?limit=10")
 check(s == 200 and len(feed) >= 4, "event history is queryable",
       f"{len(feed)} recent events stored")
 
-# 15 ─ audit ledger ---------------------------------------------------------
-section("15. Tamper-proof audit ledger")
+# 16 ─ driver app (proof of delivery) -----------------------------------------
+section("16. Driver app: jobs + proof of delivery")
+drv = drivers[0]
+s, jobs = call("GET", f"/driver/{drv['id']}/jobs")
+if check(s == 200, "driver's own jobs listed",
+         f"{len(jobs.get('jobs', []))} active job(s) for {drv['full_name']}"):
+    job = jobs["jobs"][0]
+    ok("job carries what a driver needs",
+       f"shipment #{job['shipment_id']} {job['origin_name']} -> "
+       f"{job['destination_name']}, vehicle {job['plate']}")
+    png = b"\x89PNG fake proof photo for the demo"
+    import httpx
+    r = httpx.post(
+        f"{BASE}/driver/{drv['id']}/jobs/{job['assignment_id']}/deliver",
+        data={"note": "demo delivery"}, files={"photo": ("proof.png", png, "image/png")})
+    check(r.status_code == 200 and r.json()["proof_recorded"] is True,
+          "delivery confirmed with optional photo proof",
+          f"shipment #{job['shipment_id']} completed")
+    s, after = call("GET", f"/driver/{drv['id']}/jobs")
+    check(all(j["assignment_id"] != job["assignment_id"]
+              for j in after.get("jobs", [])),
+          "delivered job left the driver's work list")
+    s, comp = call("GET", "/events?kind=assignment.completed&limit=5")
+    check(s == 200 and any(e["shipment_id"] == job["shipment_id"] for e in comp),
+          "completion flowed through the event pipeline")
+try:
+    with urllib.request.urlopen(f"{BASE}/driver-app/") as resp:
+        pwa_status, pwa_html = resp.status, resp.read().decode()
+except urllib.error.HTTPError as e:
+    pwa_status, pwa_html = e.code, ""
+check(pwa_status == 200 and "Driver App" in pwa_html,
+      "driver PWA served at /driver-app/ (installable, offline)")
+
+# 17 ─ audit ledger ---------------------------------------------------------
+section("17. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",

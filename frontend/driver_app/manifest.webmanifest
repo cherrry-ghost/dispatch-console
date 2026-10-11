@@ -1,0 +1,12 @@
+{
+  "name": "Driver App — Dispatch Console",
+  "short_name": "Driver",
+  "description": "Driver jobs and proof of delivery for the dispatch console",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f3f4f6",
+  "theme_color": "#1d4ed8",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
