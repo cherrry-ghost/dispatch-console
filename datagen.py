@@ -6,6 +6,7 @@ the endpoint decides how to insert them.
 """
 from random import Random
 
+from delay_model import route_features, synthetic_truth, travel_minutes
 from zones import haversine_km
 
 CITIES = [
@@ -46,8 +47,10 @@ def _plate(rng, used):
             return plate
 
 
-def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments):
-    """Return dicts for locations, roads, vehicles, drivers, shipments."""
+def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments,
+                   n_history=0):
+    """Return dicts for locations, roads, vehicles, drivers, shipments,
+    plus completed-shipment history with true delays for model training."""
     rng = Random(seed)
 
     cities = rng.sample(CITIES, min(n_locations, len(CITIES)))
@@ -167,7 +170,57 @@ def generate_world(seed, n_locations, n_vehicles, n_drivers, n_shipments):
                                       if rng.random() < 0.3 else None),
         })
 
+    # Completed history for the delay model: shipments that "already ran"
+    # weeks ago, with the true delay planted by synthetic_truth().
+    history = []
+    if n_history:
+        import networkx as nx
+        truth_rng = Random(seed + 777)
+        g = nx.Graph()
+        for road in roads:
+            if road["status"] == "open":
+                g.add_edge(road["from"], road["to"],
+                           distance_km=road["distance_km"],
+                           risk_score=road["risk_score"])
+        tries = 0
+        while len(history) < n_history and tries < n_history * 10:
+            tries += 1
+            origin, dest = rng.sample(range(n), 2)
+            try:
+                path = nx.shortest_path(g, origin, dest, weight="distance_km")
+            except nx.NetworkXNoPath:
+                continue
+            legs = [g[a][b] for a, b in zip(path, path[1:])]
+            route = {
+                "path": path,
+                "distance_km": round(sum(l["distance_km"] for l in legs), 2),
+                "max_risk": max(l["risk_score"] for l in legs),
+                "avg_risk": round(sum(l["risk_score"] for l in legs)
+                                  / len(legs), 1),
+            }
+            hazardous = rng.random() < 0.1
+            sample = {
+                "description": (rng.choice(HAZMAT_CARGO) if hazardous
+                                else rng.choice(CARGO)),
+                "weight_kg": rng.randint(100, 9000),
+                "is_hazardous": hazardous,
+                "origin_id": origin,
+                "destination_id": dest,
+                "required_vehicle_type": None,
+            }
+            features = route_features(route, sample)
+            delay = synthetic_truth(features, truth_rng)
+            travel = travel_minutes(features)
+            # historical ETAs were imperfect: add estimation noise
+            sample["created_minutes_ago"] = truth_rng.randint(60, 60 * 24 * 60)
+            sample["travel_minutes"] = travel
+            sample["delay_minutes"] = delay
+            sample["eta_minutes"] = max(travel,
+                                        travel + delay
+                                        + round(truth_rng.gauss(0, 25)))
+            history.append(sample)
+
     return {
         "locations": locations, "roads": roads, "vehicles": vehicles,
-        "drivers": drivers, "shipments": shipments,
+        "drivers": drivers, "shipments": shipments, "history": history,
     }

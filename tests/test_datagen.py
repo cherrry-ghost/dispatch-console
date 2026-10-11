@@ -23,7 +23,10 @@ def test_generates_a_full_small_world(client):
     assert len(client.get("/locations").json()) == 6
     assert len(client.get("/vehicles").json()) == 4
     assert len(client.get("/drivers").json()) == 4
-    assert len(client.get("/shipments").json()) == 8
+    shipments = client.get("/shipments").json()
+    assert sum(1 for s in shipments if s["status"] == "pending") == 8
+    assert sum(1 for s in shipments if s["status"] == "completed") == 20
+    assert len(shipments) == 28
     assert len(client.get("/road-edges").json()) == data["roads"]
 
 
