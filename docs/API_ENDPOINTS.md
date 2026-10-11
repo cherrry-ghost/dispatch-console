@@ -1,0 +1,66 @@
+# API endpoints
+
+Auto-generated from the OpenAPI schema (`/docs` has the interactive version).
+
+- `GET    /` — Home
+- `GET    /anomalies` — List Anomalies
+- `GET    /approvals` — List Approvals
+- `POST   /approvals/{approval_id}/decision` — Decide Approval
+- `GET    /assignments` — List Assignments
+- `POST   /assignments` — Create Assignment
+- `GET    /audit` — List Audit
+- `GET    /audit/verify` — Verify Audit
+- `POST   /copilot/ask` — Copilot Ask
+- `GET    /copilot/proposals` — List Copilot Proposals
+- `POST   /copilot/proposals/{proposal_id}/decision` — Copilot Decide
+- `POST   /datagen` — Run Datagen
+- `POST   /driver/login` — Driver Login
+- `GET    /driver/{driver_id}/jobs` — Driver Jobs
+- `POST   /driver/{driver_id}/jobs/{assignment_id}/deliver` — Deliver Job
+- `POST   /driver/{driver_id}/jobs/{assignment_id}/incident` — Driver Report Incident
+- `GET    /drivers` — List Drivers
+- `POST   /drivers` — Create Driver
+- `GET    /events` — List Events
+- `GET    /health` — Health
+- `GET    /incidents` — List Incidents
+- `POST   /incidents` — Report Incident
+- `GET    /incidents/{incident_id}` — Get Incident
+- `POST   /incidents/{incident_id}/dismiss` — Dismiss Incident
+- `POST   /incidents/{incident_id}/evidence` — Attach Evidence
+- `POST   /incidents/{incident_id}/resolve` — Resolve Incident
+- `POST   /incidents/{incident_id}/verify` — Verify Incident
+- `GET    /locations` — List Locations
+- `POST   /locations` — Create Location
+- `POST   /login` — Login
+- `POST   /media/check/{media_kind}/{ref_id}` — Recheck Media
+- `GET    /media/checks` — List Media Checks
+- `GET    /media/checks/delivery/{ref_id}` — Latest Delivery Check
+- `GET    /media/checks/evidence/{ref_id}` — Latest Evidence Check
+- `GET    /metrics` — Metrics
+- `GET    /model/health` — Model Health
+- `POST   /model/train` — Train Model
+- `GET    /notifications` — List Notifications
+- `POST   /planner/propose` — Propose Plan
+- `GET    /playbooks` — List Playbooks
+- `POST   /playbooks` — Create Playbook
+- `POST   /playbooks/{playbook_id}/apply` — Apply Playbook
+- `POST   /playbooks/{playbook_id}/test` — Test Playbook
+- `POST   /predict/eta` — Predict Eta
+- `GET    /road-edges` — List Road Edges
+- `POST   /road-edges` — Create Road Edge
+- `POST   /road-edges/{edge_id}/status` — Set Road Status
+- `GET    /route` — Get Route
+- `POST   /route/use-request` — Request Route Use
+- `GET    /routes` — List Routes
+- `GET    /shipments` — List Shipments
+- `POST   /shipments` — Create Shipment
+- `POST   /simulate/disruption` — Simulate Disruption
+- `POST   /simulate/scenario` — Simulate Scenario
+- `GET    /vehicles` — List Vehicles
+- `POST   /vehicles` — Create Vehicle
+- `GET    /vehicles/positions` — All Latest Positions
+- `GET    /vehicles/{vehicle_id}/position` — Latest Position
+- `POST   /vehicles/{vehicle_id}/position` — Report Position
+- `GET    /zones` — List Zones
+- `POST   /zones` — Create Zone
+- `POST   /zones/{zone_id}/status` — Set Zone Status
