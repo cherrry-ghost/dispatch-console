@@ -21,6 +21,7 @@ function refreshHeader() {
   $("who").innerHTML = token() && name ? `Signed in: <b>${name}</b>` : "";
   $("logout").style.display = token() ? "inline-block" : "none";
   $("loginBox").style.display = token() ? "none" : "";
+  $("licence").style.display = token() ? "" : "none";
 }
 function signOut() {
   localStorage.removeItem(TOKEN_KEY);
@@ -145,12 +146,27 @@ async function loadJobs() {
 
 function render(data, driverId) {
   const jobs = data.jobs || [];
-  if (!jobs.length) {
-    $("jobs").innerHTML =
-      `<p>No active jobs for ${data.driver?.full_name || "this driver"}.</p>`;
-    return;
+  const done = data.completed || [];
+  const pool = data.pending_pool ?? 0;
+
+  // licence status chip (green / amber / red)
+  const licEl = $("licence");
+  const lic = data.driver?.licence_expiry;
+  if (licEl && lic) {
+    const days = Math.floor((new Date(lic) - Date.now()) / 86400000);
+    const cls = days < 0 ? "lic-expired" : days < 60 ? "lic-soon" : "lic-ok";
+    const tail = days < 0 ? " — EXPIRED"
+      : days < 60 ? ` (${days} day${days === 1 ? "" : "s"} left)` : "";
+    licEl.innerHTML =
+      `Licence <b>${data.driver.licence_number || ""}</b> ` +
+      `<span class="lic ${cls}">valid till ${String(lic).slice(0, 10)}${tail}</span>`;
   }
-  $("jobs").innerHTML = jobs.map((j) => `
+
+  let html = `<h2 class="sect">Active jobs (${jobs.length})</h2>`;
+  if (!jobs.length) {
+    html += `<p class="meta">No open jobs right now.</p>`;
+  }
+  html += jobs.map((j) => `
     <div class="job" data-id="${j.assignment_id}">
       <h3>Job #${j.assignment_id} — Shipment #${j.shipment_id}</h3>
       <p>${j.description || "(no description)"} · ${j.weight_kg} kg</p>
@@ -179,6 +195,26 @@ function render(data, driverId) {
         </details>
       </div>
     </div>`).join("");
+
+  html += `<h2 class="sect">Completed — latest (${done.length})</h2>`;
+  html += done.length
+    ? done.map((j) => `
+      <div class="done-row">
+        ✔ Job #${j.assignment_id} — Shipment #${j.shipment_id}:
+        ${j.description || "(no description)"} (${j.origin_name} → ${j.destination_name})
+        ${j.delivery_note ? `— “${j.delivery_note}”` : ""}
+        <span class="when">delivered ${
+          j.delivered_at ? String(j.delivered_at).slice(0, 16).replace("T", " ") : "—"
+        }</span>
+      </div>`).join("")
+    : `<p class="meta">Nothing completed yet.</p>`;
+
+  html += `<h2 class="sect">Available work</h2>` +
+    `<p class="meta">Jobs are given by the office — drivers cannot claim work ` +
+    `themselves. ${pool} shipment${pool === 1 ? " is" : "s are"} waiting in ` +
+    `the dispatch pool.</p>`;
+
+  $("jobs").innerHTML = html;
 
   $("jobs").querySelectorAll("[data-incident]").forEach((btn) => {
     btn.addEventListener("click", async () => {

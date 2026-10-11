@@ -29,6 +29,9 @@ def append_audit(conn, actor_type, action, outcome, actor_id=None,
     # the authenticated username fills in actor_id automatically for any
     # endpoint that does not name its actor explicitly
     actor_id = actor_id if actor_id is not None else current_actor.get()
+    # entity_id is stored as text; normalise before hashing so an int
+    # argument hashes the same value the database will return
+    entity_id = str(entity_id) if entity_id is not None else None
     # Turn dates etc. into plain JSON so the hash matches what the DB stores.
     details = json.loads(json.dumps(details, default=str))
     conn.execute("LOCK TABLE audit_log IN EXCLUSIVE MODE")

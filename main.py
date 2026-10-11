@@ -8,7 +8,7 @@ import os
 
 import networkx as nx
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
@@ -1361,10 +1361,12 @@ MAX_EVIDENCE_BYTES = 20 * 1024 * 1024  # 20 MB, photos or short videos
 
 @app.get("/driver/{driver_id}/jobs")
 def driver_jobs(driver_id: int):
-    """The driver app's work list: active assignments for one driver only."""
+    """The driver app's work list: active jobs, recent completed jobs,
+    the dispatch pool, and the driver's own licence status."""
     with get_connection() as conn:
         driver = conn.execute(
-            "SELECT id, full_name FROM drivers WHERE id = %s", (driver_id,)
+            "SELECT id, full_name, licence_number, licence_expiry "
+            "FROM drivers WHERE id = %s", (driver_id,)
         ).fetchone()
         if driver is None:
             raise HTTPException(status_code=404, detail="Driver not found")
@@ -1386,7 +1388,23 @@ def driver_jobs(driver_id: int):
             "ORDER BY a.started_at",
             (driver_id,),
         ).fetchall()
-    return {"driver": driver, "jobs": jobs}
+        completed = conn.execute(
+            "SELECT a.id AS assignment_id, a.ended_at, a.delivered_at, "
+            "a.delivery_note, s.id AS shipment_id, s.description, "
+            "o.name AS origin_name, d.name AS destination_name "
+            "FROM assignments a "
+            "JOIN shipments s ON s.id = a.shipment_id "
+            "JOIN locations o ON o.id = s.origin_id "
+            "JOIN locations d ON d.id = s.destination_id "
+            "WHERE a.driver_id = %s AND a.ended_at IS NOT NULL "
+            "ORDER BY a.ended_at DESC LIMIT 10",
+            (driver_id,),
+        ).fetchall()
+        pending_pool = conn.execute(
+            "SELECT count(*) AS n FROM shipments WHERE status = 'pending'"
+        ).fetchone()["n"]
+    return {"driver": driver, "jobs": jobs, "completed": completed,
+            "pending_pool": pending_pool}
 
 
 async def _save_delivery_proof(assignment_id, file: UploadFile | None):
@@ -1456,7 +1474,7 @@ async def driver_report_incident(driver_id: int, assignment_id: int,
 
 @app.post("/driver/{driver_id}/jobs/{assignment_id}/deliver")
 async def deliver_job(driver_id: int, assignment_id: int,
-                      note: str = "", photo: UploadFile | None = None,
+                      note: str = Form(""), photo: UploadFile | None = None,
                       user: dict = Depends(require_driver)):
     """The driver marks the job delivered. Photo proof is optional - never
     mandatory, and never a condition for confirming a delivery."""
