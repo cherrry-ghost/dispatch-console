@@ -207,6 +207,56 @@ function App() {
               </p>
             </div>
 
+            <div className="card">
+              <h2>Zones — what the shaded areas mean</h2>
+              <p style={{ marginTop: 0 }}>
+                A zone is an area we draw on the map (name, centre point, radius in km).
+                <b> Forbidden zones</b> are danger areas (war, conflict, disaster): before any
+                route is calculated, every road inside them is removed from the map, so
+                planned deliveries <b>automatically go around them</b>. If a truck drives in
+                anyway, live tracking raises a loud warning — it never remotely blocks the truck.
+                <b> Alert zones</b> are caution areas: routing may pass through, but crossing
+                one fires an event. <b>Inactive</b> zones are kept for the record only and
+                affect nothing.
+              </p>
+              {zones.length === 0 && <p>No zones drawn yet.</p>}
+              {zones.length > 0 && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th><th>Type</th><th>Radius</th><th>Status</th><th>What it does</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {zones.map((z) => (
+                      <tr key={`zrow-${z.id}`}>
+                        <td>{z.name}</td>
+                        <td>
+                          <span className={`badge ${
+                            !z.active ? "badge-muted"
+                            : z.zone_type === "forbidden" ? "badge-danger" : "badge-warn"
+                          }`}>
+                            {z.zone_type === "forbidden" ? "Forbidden" : "Alert"}
+                          </span>
+                        </td>
+                        <td>{z.radius_km} km</td>
+                        <td>{z.active
+                          ? <span className="text-ok">Active</span>
+                          : <span className="muted">Inactive</span>}</td>
+                        <td>
+                          {!z.active
+                            ? "Not in effect — kept for the record only."
+                            : z.zone_type === "forbidden"
+                              ? "Routing goes around it; entering it triggers a live warning."
+                              : "Routing may pass through; crossing it fires an event."}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
             <div className="grid two-col">
               <div className="card" style={{ marginBottom: 0 }}>
                 <LiveVehicles />
