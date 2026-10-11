@@ -59,3 +59,21 @@ def test_works_with_dict_row_connections():
     with psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row) as conn:
         make_rows(conn, 2)
         assert verify_chain(conn) == {"ok": True, "checked": 2}
+
+def test_entity_id_accepts_int_and_verifies():
+    """Regression: entity_id column is TEXT; passing an int must hash the
+    same value the database returns, or verify_chain breaks."""
+    from audit import append_audit
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        append_audit(conn, "system", "regression.int_entity", "allowed",
+                     actor_id="system", entity_type="driver", entity_id=1,
+                     details={"k": 1, "longer_key": 2})
+        conn.commit()
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        result = verify_chain(conn)
+        assert result["ok"] is True, result
+        row = conn.execute(
+            "SELECT entity_id FROM audit_log "
+            "WHERE action = 'regression.int_entity' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row[0] == "1"

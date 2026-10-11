@@ -88,6 +88,14 @@ function App() {
   const activeAssignments = assignments.filter((a) => a.ended_at === null).length;
   const modelTrained = health?.delay_model === "trained";
 
+  const licenceBadge = (expiry) => {
+    if (!expiry) return <span className="badge badge-muted">no licence</span>;
+    const days = Math.floor((new Date(expiry) - Date.now()) / 86400000);
+    if (days < 0) return <span className="badge badge-danger">expired</span>;
+    if (days < 60) return <span className="badge badge-warn">{days} days left</span>;
+    return <span className="badge badge-ok">{String(expiry).slice(0, 10)}</span>;
+  };
+
   const kpis = [
     { lbl: "Vehicles", num: String(vehicles.length), sub: `${idle} idle` },
     { lbl: "Drivers", num: String(drivers.length), sub: "" },
@@ -269,29 +277,66 @@ function App() {
         )}
 
         {tab === "fleet" && (
-          <div className="card">
-            <h2>Fleet</h2>
-            {vehicles.length === 0 && <p>No vehicles yet.</p>}
-            {vehicles.length > 0 && (
-              <table>
-                <thead>
-                  <tr>
-                    <th>Plate</th><th>Type</th><th>Capacity (kg)</th><th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {vehicles.map((v) => (
-                    <tr key={v.id}>
-                      <td>{v.plate}</td>
-                      <td>{v.vehicle_type}</td>
-                      <td>{v.capacity_kg}</td>
-                      <td>{fleetStatus(v.id)}</td>
+          <>
+            <div className="card">
+              <h2>Fleet</h2>
+              {vehicles.length === 0 && <p>No vehicles yet.</p>}
+              {vehicles.length > 0 && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Plate</th><th>Type</th><th>Capacity (kg)</th><th>Status</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+                  </thead>
+                  <tbody>
+                    {vehicles.map((v) => (
+                      <tr key={v.id}>
+                        <td>{v.plate}</td>
+                        <td>{v.vehicle_type}</td>
+                        <td>{v.capacity_kg}</td>
+                        <td>{fleetStatus(v.id)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="card">
+              <h2>Drivers — licence status</h2>
+              <p style={{ marginTop: 0, marginBottom: 10 }}>
+                Guardrails refuse any assignment to a driver whose licence has expired.
+              </p>
+              {drivers.length === 0 && <p>No drivers yet.</p>}
+              {drivers.length > 0 && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th><th>Driver</th><th>Licence No.</th>
+                      <th>Licence expiry</th><th>Hazmat</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {drivers.slice(0, 40).map((d) => (
+                      <tr key={d.id}>
+                        <td>{d.id}</td>
+                        <td>{d.full_name}</td>
+                        <td>{d.licence_number}</td>
+                        <td>{licenceBadge(d.licence_expiry)}</td>
+                        <td>{d.hazmat_certified
+                          ? <span className="badge badge-muted">hazmat</span>
+                          : <span className="muted">–</span>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {drivers.length > 40 && (
+                <p className="muted" style={{ marginBottom: 0 }}>
+                  Showing first 40 of {drivers.length} drivers.
+                </p>
+              )}
+            </div>
+          </>
         )}
 
         {tab === "operations" && (

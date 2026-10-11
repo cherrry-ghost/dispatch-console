@@ -90,6 +90,22 @@
     .done { color: var(--ok); font-weight: 600; }
     #queue { font-size: 13px; color: var(--warn); padding: 8px 16px 0; }
     .meta { color: var(--faint); font-size: 13px; }
+    .licence { padding: 10px 14px; font-size: 13.5px; color: var(--muted); display: none; }
+    .licence b { color: var(--text); }
+    .lic { padding: 2px 10px; border-radius: 999px; font-weight: 600; font-size: 12px; margin-left: 6px; }
+    .lic-ok { background: rgba(52, 211, 153, 0.15); color: var(--ok); }
+    .lic-soon { background: rgba(251, 191, 36, 0.14); color: var(--warn); }
+    .lic-expired { background: rgba(248, 113, 113, 0.15); color: var(--danger); }
+    h2.sect {
+      font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase;
+      color: var(--accent); margin: 18px 0 8px;
+    }
+    .done-row {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 12px; margin-bottom: 8px;
+      font-size: 13.5px; color: var(--muted);
+    }
+    .done-row .when { color: var(--faint); font-size: 12px; display: block; }
   </style>
 </head>
 <body>
@@ -103,6 +119,7 @@
   </header>
   <div id="queue"></div>
   <main>
+    <div id="licence" class="card licence"></div>
     <div class="card signin" id="loginBox">
       <label>Driver ID: <input id="driverId" type="number" value="1" /></label>
       <label>PIN: <input id="pin" type="password" value="" size="6"

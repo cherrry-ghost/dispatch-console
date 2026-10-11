@@ -44,7 +44,10 @@ def test_jobs_lists_only_that_driver(client):
     driver_id, assignment_id, shipment_id = build_world(client)
     data = client.get(f"/driver/{driver_id}/jobs").json()
     assert data["driver"]["id"] == driver_id
+    assert data["driver"]["licence_expiry"] == "2035-12-31"
     assert len(data["jobs"]) == 1
+    assert data["completed"] == []
+    assert data["pending_pool"] == 0  # the only shipment was just assigned
     job = data["jobs"][0]
     assert job["assignment_id"] == assignment_id
     assert job["shipment_id"] == shipment_id
@@ -75,7 +78,11 @@ def test_deliver_completes_job_without_photo(client, driver_login):
     shipments = client.get("/shipments").json()
     done = next(s for s in shipments if s["id"] == shipment_id)
     assert done["status"] == "completed" and done["delivered_at"] is not None
-    assert client.get(f"/driver/{driver_id}/jobs").json()["jobs"] == []
+    data = client.get(f"/driver/{driver_id}/jobs").json()
+    assert data["jobs"] == []
+    assert len(data["completed"]) == 1
+    assert data["completed"][0]["assignment_id"] == assignment_id
+    assert data["completed"][0]["delivery_note"] == "handed to storekeeper"
 
     # pipeline event + audit under the driver's own name
     events = client.get("/events?kind=assignment.completed").json()
