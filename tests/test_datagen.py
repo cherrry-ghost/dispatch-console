@@ -83,6 +83,22 @@ def test_generated_world_works_with_the_planner(client):
     assert data["summary"]["eligible_vehicles"] >= 0
 
 
+def test_world_has_depots_speeds_and_time_windows(client):
+    run_datagen(client, {"scale": "small", "seed": 3})
+
+    depots = [l for l in client.get("/locations").json() if l["is_depot"]]
+    assert len(depots) >= 1
+    vehicles = client.get("/vehicles").json()
+    depot_ids = {l["id"] for l in depots}
+    assert all(v["home_depot_id"] in depot_ids for v in vehicles)
+    assert all(5 <= v["speed_kmh"] <= 120 for v in vehicles)
+    ships = client.get("/shipments").json()
+    assert all(s["ready_minute"] >= 0 for s in ships)
+    assert all(s["deadline_minute"] is None
+               or s["deadline_minute"] > s["ready_minute"] for s in ships)
+    assert any(s["deadline_minute"] is not None for s in ships)
+
+
 def test_datagen_run_is_audited_and_chain_verifies(client):
     run_datagen(client, {"scale": "small", "seed": 1})
     logged = [row for row in client.get("/audit?limit=20").json()
