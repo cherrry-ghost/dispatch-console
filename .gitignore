@@ -6,3 +6,6 @@ append_audit.txt
 *:Zone.Identifier
 evidence/
 models/
+frontend/node_modules/
+frontend/dist/
+*.log

@@ -38,7 +38,16 @@ from notifications import (notify, assigned_message, delivered_message,
 import copilot as copilot_engine
 import media as media_engine
 
-app = FastAPI()
+app = FastAPI(
+    title="Smart Logistics Dispatch Console",
+    description=(
+        "Dispatch console with deterministic guardrails, a tamper-proof "
+        "audit ledger, live tracking, an event pipeline, customer "
+        "notifications, a guardrailed AI copilot and media authenticity "
+        "checks. The AI proposes - humans decide."
+    ),
+    version="1.0.0",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -586,12 +595,17 @@ def get_connection():
 
 @app.get("/")
 def home():
-    return {"message": "Dispatch console is running"}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    """Landing point: the console, the docs and the machine-readable views."""
+    return {
+        "message": "Smart Logistics Dispatch Console is running",
+        "console": "http://localhost:5173 (React dev server)",
+        "driver_app": "/driver-app/",
+        "interactive_docs": "/docs",
+        "health": "/health",
+        "metrics": "/metrics",
+        "audit_verify": "/audit/verify",
+        "end_to_end_demo": "python demo.py (76+ automated checks)",
+    }
 
 
 @app.get("/vehicles")
