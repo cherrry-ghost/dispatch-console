@@ -18,6 +18,7 @@ from zones import split_edges_by_zones
 from validator import validate_route
 from datagen import generate_world
 from anomalies import scan as scan_anomalies
+from trust import eta_trust, planner_trust
 from delay_model import (
     FEATURES, MIN_HISTORY_FOR_TRAINING, MODEL_VERSION,
     explain as explain_delay, interval_coverage, load as load_model,
@@ -1526,6 +1527,16 @@ def predict_eta(body: PredictIn):
     eta_high = travel + round(delay_high)
     explanation = explain_delay(models, features)
     with get_connection() as conn:
+        trained = _last_training_row(conn)
+    t_details = trained["details"] if trained else {}
+    width = eta_high - eta_low
+    trust, trust_factors = eta_trust(
+        t_details.get("mae_minutes_holdout"),
+        t_details.get("interval_coverage_holdout"),
+        uncertainty_width=width,
+        samples=t_details.get("samples"),
+    )
+    with get_connection() as conn:
         append_audit(
             conn, "ai_delay_model", "eta.predicted", "allowed",
             entity_type="shipment", entity_id=str(body.shipment_id),
@@ -1543,6 +1554,7 @@ def predict_eta(body: PredictIn):
                      "uncertainty": {"low_minutes": eta_low,
                                      "high_minutes": eta_high},
                      "explanation": explanation,
+                     "trust_score": trust,
                      "model": "xgboost", "model_version": MODEL_VERSION},
         )
     return {"shipment_id": body.shipment_id, "eta_minutes": eta,
@@ -1552,8 +1564,90 @@ def predict_eta(body: PredictIn):
                             "high_minutes": eta_high,
                             "confidence": 0.8},
             "explanation": explanation,
+            "trust_score": {"score": trust, "factors": trust_factors},
             "features_used": features,
             "model": {"name": "xgboost", "version": MODEL_VERSION}}
+
+
+def _last_training_row(conn):
+    return conn.execute(
+        "SELECT created_at, details FROM audit_log "
+        "WHERE action = 'model.trained' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def _drift_status(models, conn, holdout_mae):
+    """Compare error on the newest completed trips with training error."""
+    recent = conn.execute(
+        "SELECT * FROM shipments WHERE status = 'completed' "
+        "AND delay_minutes IS NOT NULL "
+        "ORDER BY delivered_at DESC NULLS LAST LIMIT 40"
+    ).fetchall()
+    edges = conn.execute("SELECT * FROM road_edges").fetchall()
+    errors, checked = [], 0
+    for s in recent:
+        route = shortest_route(edges, s["origin_id"], s["destination_id"])
+        if route is None:
+            continue
+        features = route_features(route, s)
+        errors.append(abs(predict_median(models, features)
+                          - s["delay_minutes"]))
+        checked += 1
+    if checked < 5 or not holdout_mae:
+        return {"status": "unknown", "recent_trips": checked,
+                "recent_mae_minutes": None, "ratio": None}
+    recent_mae = round(sum(errors) / len(errors), 1)
+    ratio = round(recent_mae / holdout_mae, 2)
+    return {"status": "ok" if ratio <= 1.5 else "drift_detected",
+            "recent_trips": checked, "recent_mae_minutes": recent_mae,
+            "ratio": ratio}
+
+
+def _model_health():
+    """Full reliability report for the delay model, from the audit ledger."""
+    with get_connection() as conn:
+        row = _last_training_row(conn)
+        if row is None or not model_exists():
+            return {"trained": False, "model_version": MODEL_VERSION,
+                    "trust_score": {"score": 0,
+                                    "factors": {"reason": "model not "
+                                                          "trained"}},
+                    "how_to_train": "POST /model/train"}
+        details = row["details"]
+        mae = details.get("mae_minutes_holdout")
+        coverage = details.get("interval_coverage_holdout")
+        samples = details.get("samples")
+        models = load_model()
+        drift = _drift_status(models, conn, mae)
+        recent_error = drift.get("recent_mae_minutes")
+        effective_mae = max(mae or 0, recent_error or 0)
+        score, factors = eta_trust(
+            mae, coverage, drift_detected=drift["status"] == "drift_detected",
+            samples=samples)
+        if recent_error is not None:
+            factors["recent_trips_mae_minutes"] = recent_error
+        return {"trained": True, "model_version": MODEL_VERSION,
+                "trained_at": row["created_at"],
+                "samples": samples,
+                "holdout": {"mae_minutes": mae,
+                            "interval_coverage": coverage},
+                "drift": drift,
+                "effective_mae_minutes": round(effective_mae, 1),
+                "trust_score": {"score": score, "factors": factors}}
+
+
+@app.get("/model/health")
+def model_health():
+    health = _model_health()
+    with get_connection() as conn:
+        append_audit(
+            conn, "system", "model.health", "allowed",
+            entity_type="model", entity_id=str(health["model_version"]),
+            details={"trained": health["trained"],
+                     "trust_score": health["trust_score"]["score"],
+                     "drift": health.get("drift", {}).get("status")},
+        )
+    return health
 
 
 @app.get("/anomalies")
@@ -1618,6 +1712,10 @@ def propose_plan(body: PlannerRequest):
             ).fetchall()
         plan = plan_shipments(shipments, vehicles, date.today(),
                               edges=edges, locations=locations)
+        trust, trust_factors = planner_trust(
+            plan["summary"]["shipments_considered"],
+            len(plan["skipped"]), plan["travel_model"],
+            plan["summary"]["eligible_vehicles"])
         run_id = uuid4().hex[:12]
         # The planner is an AI actor: the input snapshot, the recommendation
         # and the skips are recorded before a human decides anything.
@@ -1635,6 +1733,8 @@ def propose_plan(body: PlannerRequest):
                 "vehicles": plan["vehicles"],
                 "skipped": plan["skipped"],
                 "summary": plan["summary"],
+                "trust_score": trust,
             },
         )
-    return {"plan_id": run_id, **plan}
+    return {"plan_id": run_id, **plan,
+            "trust_score": {"score": trust, "factors": trust_factors}}

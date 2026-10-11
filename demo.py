@@ -114,6 +114,9 @@ skipped = b.get("skipped", [])
 check(s == 200 and props, "planner produced a plan",
       f"{len(props)} shipments placed, {len(skipped)} skipped "
       f"({skipped[0]['reason'][:60]}...)" if skipped else f"{len(props)} placed")
+trust = b.get("trust_score", {})
+if props and trust.get("score") is not None:
+    ok("plan declares its trust", f"{trust['score']}/100")
 s, before = call("GET", "/assignments")
 check(b.get("plan_id") is not None, "plan has an id",
       f"plan {str(b.get('plan_id'))[:13]}...")
@@ -262,6 +265,7 @@ if check(s == 200, "model trained on completed history",
     s1, p1 = call("POST", "/predict/eta", {"shipment_id": target})
     s2, p2 = call("POST", "/predict/eta", {"shipment_id": target})
     unc = p1.get("uncertainty", {})
+    trust = p1.get("trust_score", {})
     if check(s1 == 200, "ETA predicted with an uncertainty range",
              f"drive {p1.get('travel_minutes'):.0f} min + delay "
              f"{p1.get('predicted_delay_minutes'):.0f} min "
@@ -270,6 +274,14 @@ if check(s == 200, "model trained on completed history",
              f"{unc.get('high_minutes', 0):.0f})"):
         ok("range brackets the answer",
            f"confidence {int(unc.get('confidence', 0) * 100)}%")
+        if check(0 <= trust.get("score", -1) <= 100,
+                 "prediction carries a trust score",
+                 f"{trust.get('score')}/100 from measured accuracy"):
+            s3, health = call("GET", "/model/health")
+            check(s3 == 200 and health.get("trained") is True,
+                  "model health report available",
+                  f"drift: {health.get('drift', {}).get('status')}, "
+                  f"health trust: {health.get('trust_score', {}).get('score')}")
     expl = p1.get("explanation", {})
     if check(bool(expl.get("top_factors")), "model explains itself"):
         ok("main reason", expl["summary"][:90])
