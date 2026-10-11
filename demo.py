@@ -531,8 +531,49 @@ if check(s == 200, "shipment created with a customer contact",
     else:
         ok("skip incident demo (assignment blocked)", str(b2)[:80])
 
-# 18 ─ audit ledger ---------------------------------------------------------
-section("18. Tamper-proof audit ledger")
+# 19 ─ AI copilot ------------------------------------------------------------
+section("19. Guardrailed AI copilot (proposes, never decides)")
+s, ans = call("POST", "/copilot/ask", {"question": "how many vehicles are idle?"})
+if check(s == 200 and ans["intent"] == "fleet_summary",
+         "copilot answers fleet questions",
+         ans.get("answer", "")[:90]):
+    ok("every answer declares what it is",
+       f"model {ans.get('model')}, confidence {ans.get('confidence')}")
+s, ans = call("POST", "/copilot/ask",
+              {"question": "what is the model health?"})
+check(s == 200 and "trust" in ans.get("answer", "").lower(),
+      "copilot reports model health with trust",
+      ans.get("answer", "")[:90])
+s, ans = call("POST", "/copilot/ask",
+              {"question": "add forbidden zone at lat 19.10 lng 72.85 radius 4"})
+if check(s == 200 and ans.get("requires_human") is True,
+         "action request became a PROPOSAL, not an execution",
+         f"intent {ans.get('intent')}, proposal #{ans.get('proposal_id')}"):
+    pid = ans["proposal_id"]
+    zones_before = {z["id"] for z in call("GET", "/zones")[1]}
+    s, d = call("POST", f"/copilot/proposals/{pid}/decision",
+                {"decision": "accepted", "note": "demo: news report"})
+    if check(s == 200 and d["outcome"] == "allowed",
+             "human accepted -> executed through the guardrails"):
+        zones_now = {z["id"] for z in call("GET", "/zones")[1]}
+        check(len(zones_now) == len(zones_before) + 1,
+              "the zone really exists after acceptance")
+        call("POST", f"/zones/{max(zones_now)}/status", {"active": False})
+s, ans = call("POST", "/copilot/ask",
+              {"question": "close road 999999"})
+check(s == 200 and ans.get("proposal") is None,
+      "impossible requests are refused with an explanation",
+      ans.get("answer", "")[:80])
+s, ledger = call("GET", "/copilot/proposals")
+check(s == 200 and ledger, "decision ledger is queryable",
+      f"{len(ledger)} proposal(s), latest: {ledger[0]['status']}")
+s, acts = call("GET", "/audit?limit=100")
+check(any(a["action"] == "copilot.suggested" for a in acts)
+      and any(a["action"] == "copilot.accepted" for a in acts),
+      "both the AI and the human left audit entries")
+
+# 20 ─ audit ledger ---------------------------------------------------------
+section("20. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",
