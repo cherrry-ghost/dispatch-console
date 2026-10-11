@@ -5,6 +5,7 @@ Start the server, then run:  python demo.py
 Optional:  python demo.py http://localhost:8010
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -12,6 +13,8 @@ import tempfile
 import urllib.error
 import urllib.request
 from random import Random
+
+import websockets
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8010"
 PASS, FAIL = [], []
@@ -342,8 +345,53 @@ if check(s == 200, "history scanned for anomalies",
     for a in an.get("anomalies", [])[:2]:
         ok(f"finding: {a['kind']} ({a['severity']})", a["detail"][:90])
 
-# 13 ─ audit ledger ---------------------------------------------------------
-section("13. Tamper-proof audit ledger")
+# 13 ─ live tracking ---------------------------------------------------------
+section("13. Live vehicle tracking (WebSockets)")
+
+async def run_live(vid, base_pt):
+    ws_base = BASE.replace("http", "ws", 1)
+    seen, alert_msg = [], None
+    async with websockets.connect(f"{ws_base}/ws/live") as viewer:
+        for i in range(3):  # drive the vehicle along a short line
+            call("POST", f"/vehicles/{vid}/position",
+                 {"latitude": base_pt[0] + i * 0.01,
+                  "longitude": base_pt[1], "speed_kmh": 40 + i})
+        for _ in range(3):
+            seen.append(json.loads(await asyncio.wait_for(viewer.recv(), 10)))
+        s, z = call("POST", "/zones", {
+            "name": f"Demo tracking zone {rng.randint(1, 99999)}",
+            "center_lat": base_pt[0] + 0.05, "center_lng": base_pt[1],
+            "radius_km": 3})
+        call("POST", f"/vehicles/{vid}/position", {  # cross the new fence
+            "latitude": base_pt[0] + 0.05, "longitude": base_pt[1]})
+        alert_msg = json.loads(await asyncio.wait_for(viewer.recv(), 10))
+        if s == 200:
+            call("POST", f"/zones/{z['id']}/status", {"active": False})
+    async with websockets.connect(f"{ws_base}/ws/vehicle/{vid}") as driver:
+        await driver.send(json.dumps({
+            "latitude": base_pt[0] + 0.06, "longitude": base_pt[1],
+            "speed_kmh": 35}))
+        ack = json.loads(await asyncio.wait_for(driver.recv(), 10))
+    return seen, alert_msg, ack
+
+vid = props[0]["vehicle_id"]
+seen, alert_msg, ack = asyncio.run(run_live(vid, (locs[0]["latitude"],
+                                                  locs[0]["longitude"])))
+check(len(seen) == 3 and abs(seen[-1]["latitude"] - (locs[0]["latitude"] + 0.02)) < 1e-9,
+      "console received every position live", f"{len(seen)} broadcasts")
+check(bool(alert_msg and alert_msg.get("zone_alert")),
+      "zone breach pushed to consoles in real time",
+      alert_msg["zone_alert"]["zone_name"]
+      if alert_msg and alert_msg.get("zone_alert") else "no alert seen")
+check(ack.get("status") == "ok",
+      "driver channel acknowledged its ping")
+s, pos = call("GET", f"/vehicles/{vid}/position")
+check(s == 200 and abs(pos["latitude"] - (locs[0]["latitude"] + 0.06)) < 1e-9,
+      "latest position stored server-side",
+      f"lat {pos['latitude']:.4f}, source {pos['source']}")
+
+# 14 ─ audit ledger ---------------------------------------------------------
+section("14. Tamper-proof audit ledger")
 s, log = call("GET", "/audit?limit=100")
 actors = sorted({r["actor_type"] for r in log})
 check(s == 200 and len(log) > 10, "every step left a trail",

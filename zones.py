@@ -45,6 +45,12 @@ def edge_hits_zone(from_loc, to_loc, zone):
     ) <= zone["radius_km"]
 
 
+def point_in_zone(lat, lng, zone):
+    """True if a single point (e.g. a vehicle position) is inside the zone."""
+    distance = haversine_km(lat, lng, zone["center_lat"], zone["center_lng"])
+    return distance <= zone["radius_km"]
+
+
 def split_edges_by_zones(edges, zones, locations):
     """Separate road rows into (allowed, blocked).
 

@@ -10,6 +10,7 @@ import "leaflet/dist/leaflet.css";
 import AuditViewer from "./AuditViewer";
 import AssignmentForm from "./AssignmentForm";
 import ApprovalsPanel from "./ApprovalsPanel";
+import LiveVehicles from "./LiveVehicles";
 
 const API_URL = "http://localhost:8010";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments"];
@@ -117,6 +118,12 @@ function App() {
           ))}
         </tbody>
       </table>
+
+      <LiveVehicles
+        onZoneAlert={(text) =>
+          window.alert(text + " — live tracking has flagged this.")
+        }
+      />
 
       <AssignmentForm
         shipments={shipments}

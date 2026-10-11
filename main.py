@@ -28,6 +28,8 @@ from delay_model import (
 )
 from typing import Literal
 from psycopg.types.json import Jsonb
+from fastapi import WebSocket, WebSocketDisconnect
+from zones import point_in_zone
 
 app = FastAPI()
 app.add_middleware(
@@ -36,6 +38,170 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class LiveManager:
+    """Tracks console viewers on /ws/live and pushes new positions to them."""
+
+    def __init__(self):
+        self.viewers = set()
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.viewers.add(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.viewers.discard(ws)
+
+    async def broadcast(self, message: dict):
+        for ws in list(self.viewers):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                self.viewers.discard(ws)
+
+
+live = LiveManager()
+# last known in-zone state per vehicle, so zone alerts fire on transitions
+_in_zone_state = {}
+
+
+def _latest_positions(conn):
+    return conn.execute(
+        "SELECT DISTINCT ON (vehicle_id) vehicle_id, latitude, longitude, "
+        "speed_kmh, source, recorded_at "
+        "FROM vehicle_positions ORDER BY vehicle_id, recorded_at DESC"
+    ).fetchall()
+
+
+async def _ingest_position(vehicle_id, lat, lng, speed_kmh, source):
+    """Validate, store, zone-check and broadcast one vehicle position."""
+    with get_connection() as conn:
+        vehicle = conn.execute(
+            "SELECT id FROM vehicles WHERE id = %s", (vehicle_id,)
+        ).fetchone()
+        if vehicle is None:
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+        conn.execute(
+            "INSERT INTO vehicle_positions (vehicle_id, latitude, longitude, "
+            "speed_kmh, source) VALUES (%s, %s, %s, %s, %s)",
+            (vehicle_id, lat, lng, speed_kmh, source),
+        )
+        zones = conn.execute(
+            "SELECT * FROM zones WHERE active ORDER BY id").fetchall()
+    hit = next((z for z in zones if point_in_zone(lat, lng, z)), None)
+    was_in = _in_zone_state.get(vehicle_id, False)
+    alert = None
+    if hit is not None:
+        alert = {"zone_id": hit["id"], "zone_name": hit["name"],
+                 "radius_km": hit["radius_km"]}
+        if not was_in:
+            with get_connection() as conn:
+                append_audit(
+                    conn, "system", "vehicle.in_zone", "warning",
+                    entity_type="vehicle", entity_id=str(vehicle_id),
+                    details={"zone": hit["name"],
+                             "latitude": lat, "longitude": lng},
+                )
+    _in_zone_state[vehicle_id] = hit is not None
+    await live.broadcast({
+        "type": "position", "vehicle_id": vehicle_id,
+        "latitude": lat, "longitude": lng,
+        "speed_kmh": speed_kmh, "source": source,
+        "zone_alert": alert,
+    })
+    return alert
+
+
+class VehiclePositionIn(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    speed_kmh: float | None = Field(default=None, ge=0, le=300)
+    source: str = "gps_device"
+
+
+@app.post("/vehicles/{vehicle_id}/position")
+async def report_position(vehicle_id: int, body: VehiclePositionIn):
+    alert = await _ingest_position(vehicle_id, body.latitude, body.longitude,
+                                   body.speed_kmh, body.source)
+    return {"vehicle_id": vehicle_id, "zone_alert": alert,
+             "recorded": True}
+
+
+@app.get("/vehicles/{vehicle_id}/position")
+def latest_position(vehicle_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT vehicle_id, latitude, longitude, speed_kmh, source, "
+            "recorded_at FROM vehicle_positions WHERE vehicle_id = %s "
+            "ORDER BY recorded_at DESC LIMIT 1", (vehicle_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail="No position recorded for this vehicle")
+    return row
+
+
+@app.get("/vehicles/positions")
+def all_latest_positions():
+    with get_connection() as conn:
+        return _latest_positions(conn)
+
+
+@app.websocket("/ws/vehicle/{vehicle_id}")
+async def ws_vehicle(ws: WebSocket, vehicle_id: int):
+    """Driver-app channel: the vehicle streams positions, the server answers
+    each with status plus a zone alert when it enters forbidden ground."""
+    await ws.accept()
+    with get_connection() as conn:
+        vehicle = conn.execute(
+            "SELECT id FROM vehicles WHERE id = %s", (vehicle_id,)
+        ).fetchone()
+    if vehicle is None:
+        await ws.send_json({"status": "error", "detail": "Vehicle not found"})
+        await ws.close()
+        return
+    with get_connection() as conn:
+        append_audit(
+            conn, "driver", "tracking.started", "allowed",
+            entity_type="vehicle", entity_id=str(vehicle_id),
+            details={"channel": "websocket"},
+        )
+    try:
+        while True:
+            msg = await ws.receive_json()
+            lat = msg.get("latitude")
+            lng = msg.get("longitude")
+            if lat is None or lng is None:
+                await ws.send_json({"status": "error",
+                                    "detail": "latitude and longitude "
+                                              "are required"})
+                continue
+            alert = await _ingest_position(
+                vehicle_id, float(lat), float(lng),
+                msg.get("speed_kmh"), msg.get("source", "driver_app"))
+            await ws.send_json({"status": "ok", "zone_alert": alert})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        with get_connection() as conn:
+            append_audit(
+                conn, "driver", "tracking.stopped", "allowed",
+                entity_type="vehicle", entity_id=str(vehicle_id),
+                details={"channel": "websocket"},
+            )
+
+
+@app.websocket("/ws/live")
+async def ws_live(ws: WebSocket):
+    """Console channel: every vehicle position arrives here in real time."""
+    await live.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()  # keep the connection open; ignore pings
+    except WebSocketDisconnect:
+        pass
+    finally:
+        live.disconnect(ws)
 
 class VehicleIn(BaseModel):
     plate: str
