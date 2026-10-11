@@ -949,6 +949,133 @@ def request_route_use(body: RouteUseIn, response: Response):
             "label": label, "route": result}
 
 
+class ScenarioZoneIn(BaseModel):
+    name: str
+    center_lat: float = Field(ge=-90, le=90)
+    center_lng: float = Field(ge=-180, le=180)
+    radius_km: float = Field(gt=0)
+
+
+class SimulateIn(BaseModel):
+    kind: Literal["close_road", "add_zone", "raise_risk"]
+    edge_id: int | None = None
+    risk_score: int | None = Field(default=None, ge=0, le=100)
+    zone: ScenarioZoneIn | None = None
+
+
+def _scenario_network(scenario: SimulateIn, edges, zones):
+    """Return (edges_after, zones_after) with the hypothetical disruption
+    applied to copies - the real rows are never touched."""
+    edges_after = [dict(e) for e in edges]
+    zones_after = list(zones)
+    if scenario.kind == "close_road":
+        for e in edges_after:
+            if e["id"] == scenario.edge_id:
+                e["status"] = "closed"
+    elif scenario.kind == "raise_risk":
+        for e in edges_after:
+            if e["id"] == scenario.edge_id:
+                e["risk_score"] = scenario.risk_score
+    else:  # add_zone
+        zones_after.append({
+            "id": -1, "active": True,
+            "name": scenario.zone.name,
+            "center_lat": scenario.zone.center_lat,
+            "center_lng": scenario.zone.center_lng,
+            "radius_km": scenario.zone.radius_km,
+        })
+    return edges_after, zones_after
+
+
+@app.post("/simulate/disruption")
+def simulate_disruption(scenario: SimulateIn):
+    if scenario.kind in ("close_road", "raise_risk") and scenario.edge_id is None:
+        raise HTTPException(
+            status_code=422, detail="edge_id is required for this scenario")
+    if scenario.kind == "raise_risk" and scenario.risk_score is None:
+        raise HTTPException(
+            status_code=422, detail="risk_score is required for raise_risk")
+    if scenario.kind == "add_zone" and scenario.zone is None:
+        raise HTTPException(
+            status_code=422, detail="zone is required for add_zone")
+
+    with get_connection() as conn:
+        edges = conn.execute("SELECT * FROM road_edges").fetchall()
+        if scenario.edge_id is not None and not any(
+            e["id"] == scenario.edge_id for e in edges
+        ):
+            raise HTTPException(status_code=404, detail="Road not found")
+        locations = {
+            r["id"]: r
+            for r in conn.execute(
+                "SELECT id, latitude, longitude FROM locations"
+            ).fetchall()
+        }
+        zones = conn.execute(
+            "SELECT * FROM zones WHERE active ORDER BY id"
+        ).fetchall()
+        shipments = conn.execute(
+            "SELECT id, origin_id, destination_id FROM shipments ORDER BY id"
+        ).fetchall()
+
+    edges_after, zones_after = _scenario_network(scenario, edges, zones)
+    base_allowed, _ = split_edges_by_zones(edges, zones, locations)
+    after_allowed, _ = split_edges_by_zones(edges_after, zones_after, locations)
+
+    def best(shipment, allowed_edges, zone_list):
+        r = shortest_route(allowed_edges, shipment["origin_id"],
+                           shipment["destination_id"])
+        if r is None:
+            return None
+        if validate_route(r["path"], zone_list, locations):
+            return None  # the independent validator refuses it
+        r["label"] = route_label(r["max_risk"])
+        return r
+
+    impact = []
+    for s in shipments:
+        before = best(s, base_allowed, zones)
+        after = best(s, after_allowed, zones_after)
+        if before and after and before["path"] == after["path"]:
+            status = "unaffected" if before["label"] == after["label"] \
+                else "risk_changed"
+        elif after is None and before is not None:
+            status = "broken"
+        elif before is None and after is not None:
+            status = "restored"
+        elif before is None and after is None:
+            status = "still_blocked"
+        else:
+            status = "rerouted"
+        impact.append({
+            "shipment_id": s["id"],
+            "origin_id": s["origin_id"],
+            "destination_id": s["destination_id"],
+            "before": before,
+            "after": after,
+            "delta_km": (round(after["distance_km"] - before["distance_km"], 2)
+                         if before and after else None),
+            "status": status,
+        })
+
+    summary = {
+        "shipments_simulated": len(impact),
+        "rerouted": sum(1 for i in impact if i["status"] == "rerouted"),
+        "broken": sum(1 for i in impact if i["status"] == "broken"),
+        "risk_changed": sum(1 for i in impact if i["status"] == "risk_changed"),
+        "unaffected": sum(1 for i in impact if i["status"] == "unaffected"),
+        "max_extra_km": max((i["delta_km"] or 0 for i in impact), default=0),
+    }
+    with get_connection() as conn:
+        append_audit(
+            conn, "dispatcher", "simulation.run", "allowed",
+            entity_type="simulation", entity_id=uuid4().hex[:12],
+            details={"scenario": scenario.model_dump(), "summary": summary},
+        )
+    return {"scenario": scenario.model_dump(), "impact": impact,
+            "summary": summary}
+
+
 class PlannerRequest(BaseModel):
     shipment_ids: list[int] | None = None  # None = all pending shipments
 
