@@ -4,13 +4,14 @@ import psycopg
 
 from audit import verify_chain
 from delay_model import (
-    MODEL_PATH, synthetic_truth, route_features, travel_minutes,
+    MODEL_PATHS, synthetic_truth, route_features, travel_minutes,
 )
 
 
 def teardown_function():
-    if os.path.exists(MODEL_PATH):
-        os.remove(MODEL_PATH)  # tests must not leave a trained model behind
+    for path in MODEL_PATHS:
+        if os.path.exists(path):
+            os.remove(path)  # tests must not leave a trained model behind
 
 
 def test_history_shipments_are_generated_with_true_delays(client):
@@ -59,7 +60,9 @@ def test_full_train_and_predict_flow(client):
     assert data["holdout_samples"] >= 5
     assert data["model"] == "xgboost"
     assert data["mae_minutes_holdout"] < 45  # truth noise sigma is 20 min
-    assert os.path.exists(MODEL_PATH)
+    assert 0.0 <= data["interval_coverage_holdout"] <= 1.0
+    assert data["interval_coverage_holdout"] >= 0.4  # 80% range should catch most
+    assert all(os.path.exists(p) for p in MODEL_PATHS)
 
     pending = next(s for s in client.get("/shipments").json()
                    if s["status"] == "pending")
@@ -68,12 +71,22 @@ def test_full_train_and_predict_flow(client):
     eta = p1.json()
     assert eta["eta_minutes"] >= eta["travel_minutes"]
     assert eta["predicted_delay_minutes"] >= 0
+    unc = eta["uncertainty"]
+    assert unc["low_minutes"] <= eta["eta_minutes"] <= unc["high_minutes"]
+    assert unc["confidence"] == 0.8
+    expl = eta["explanation"]
+    assert expl["top_factors"]
+    first = expl["top_factors"][0]
+    assert first["text"] and isinstance(first["impact_minutes"], float)
+    assert "because" in expl["summary"]
     assert eta["features_used"]["avg_risk"] is not None
-    assert eta["model"]["version"] == 1
+    assert eta["model"]["version"] == 2
 
     # deterministic: same shipment, same answer
     p2 = client.post("/predict/eta", json={"shipment_id": pending["id"]})
     assert p2.json()["eta_minutes"] == eta["eta_minutes"]
+    assert p2.json()["uncertainty"] == unc
+    assert p2.json()["explanation"] == expl
 
     # the model proposed and nothing else: shipment untouched
     after = next(s for s in client.get("/shipments").json()
@@ -85,6 +98,8 @@ def test_full_train_and_predict_flow(client):
               if row["action"] == "eta.predicted"]
     assert logged and logged[0]["actor_type"] == "ai_delay_model"
     assert logged[0]["details"]["model"] == "xgboost"
+    assert logged[0]["details"]["uncertainty"]["low_minutes"] > 0
+    assert logged[0]["details"]["explanation"]["top_factors"]
     trained = [row for row in client.get("/audit?limit=50").json()
                if row["action"] == "model.trained"]
     assert trained and trained[0]["details"]["mae_minutes_holdout"] < 45
