@@ -5,7 +5,7 @@ import App from './App.jsx'
 
 // Attach the stored login token to every API call, whatever component
 // made it. GETs stay open server-side; this matters for POSTs.
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 const originalFetch = window.fetch.bind(window);
 window.fetch = (input, init = {}) => {
   const url = typeof input === "string" ? input : input.url;

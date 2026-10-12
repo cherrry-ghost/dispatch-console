@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 
 const SUGGESTIONS = [
   "How many vehicles are idle?",

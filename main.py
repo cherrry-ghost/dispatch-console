@@ -50,7 +50,10 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    # Cloud deploy: set CORS_ORIGINS to a comma-separated list (or "*").
+    # Unset locally -> wildcard, which also covers localhost:5173 dev.
+    allow_origins=[o.strip() for o in
+                   os.environ.get("CORS_ORIGINS", "*").split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-const WS_URL = "ws://localhost:8010/ws/events";
-const API_URL = "http://localhost:8010";
+import { API_URL, WS_BASE } from "./api";
 
 const SEVERITY_COLOR = {
   info: "#8ba0bf",
@@ -21,7 +20,7 @@ function EventsFeed() {
       .then((rows) => setEvents(rows))
       .catch(() => {});
 
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(`${WS_BASE}/ws/events`);
     ws.onopen = () => setConnected(true);
     ws.onclose = () => setConnected(false);
     ws.onerror = () => setConnected(false);
