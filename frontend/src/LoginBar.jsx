@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 
 // Small login bar. The token lands in localStorage; main.jsx attaches it
 // to every API call. Without a login, every POST will be refused with 401.

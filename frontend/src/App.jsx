@@ -19,7 +19,7 @@ import MediaPanel from "./MediaPanel";
 import NotificationsPanel from "./NotificationsPanel";
 import RouteOffersPanel from "./RouteOffersPanel";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments", "zones"];
 const STATUS_COLOR = { pending: "#64748b", assigned: "#38bdf8" };
 const ZONE_STYLE = {

@@ -1,7 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-
-const API_URL = "http://localhost:8010";
-const WS_URL = "ws://localhost:8010/ws/live";
+import { API_URL, WS_BASE } from "./api";
 
 // Live vehicle tracking: subscribes to the server's /ws/live channel and
 // shows every vehicle position as it arrives, with zone alerts highlighted.
@@ -28,7 +26,7 @@ function LiveVehicles({ onZoneAlert }) {
       )
       .catch(() => {});
 
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(`${WS_BASE}/ws/live`);
     ws.onopen = () => setConnected(true);
     ws.onclose = () => setConnected(false);
     ws.onerror = () => setConnected(false);

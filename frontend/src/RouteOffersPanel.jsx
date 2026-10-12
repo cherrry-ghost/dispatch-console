@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { MapContainer, TileLayer, Polyline, CircleMarker, Tooltip } from "react-leaflet";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 const LABEL_STYLE = {
   safe: { color: "#34d399", weight: 4 },
   caution: { color: "#fbbf24", weight: 4 },

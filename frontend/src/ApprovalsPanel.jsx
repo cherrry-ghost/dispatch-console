@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 
 export default function ApprovalsPanel({ refreshKey, onDone }) {
   const [rows, setRows] = useState([]);

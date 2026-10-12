@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 
 // Customer notifications history: what we told whom, and when.
 function NotificationsPanel() {

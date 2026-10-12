@@ -1,7 +1,7 @@
 import { useState } from "react";
 import ApprovalsPanel from "./ApprovalsPanel";
 
-const API_URL = "http://localhost:8010";
+import { API_URL } from "./api";
 
 export default function AssignmentForm({ shipments, vehicles, drivers, onDone }) {
   const [shipmentId, setShipmentId] = useState("");
