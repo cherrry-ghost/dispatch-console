@@ -191,6 +191,12 @@ def health():
     checks["driver_app_mounted"] = os.path.isdir(DRIVER_APP_DIR)
     checks["driver_app_path"] = DRIVER_APP_DIR
     checks["cwd"] = os.getcwd()
+    try:
+        checks["cwd_entries"] = sorted(os.listdir(os.getcwd()))[:25]
+        checks["frontend_entries"] = sorted(os.listdir(
+            os.path.join(os.getcwd(), "frontend")))[:25]
+    except Exception as exc:
+        checks["dir_listing_error"] = str(exc)
     checks["status"] = "ok"
     return checks
 
