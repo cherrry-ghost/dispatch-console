@@ -21,7 +21,7 @@ function refreshHeader() {
   $("who").innerHTML = token() && name ? `Signed in: <b>${name}</b>` : "";
   $("logout").style.display = token() ? "inline-block" : "none";
   $("loginBox").style.display = token() ? "none" : "";
-  $("profile").style.display = token() ? "" : "none";
+  $("profile").style.display = token() ? "block" : "none";
 }
 function signOut() {
   localStorage.removeItem(TOKEN_KEY);
@@ -363,6 +363,7 @@ $("login").addEventListener("click", async () => {
     $("pin").value = "";
     refreshHeader();
     loadJobs();
+    loadOffers();
   } catch (err) {
     $("loginMsg").textContent = "Could not reach the server: " + err.message;
   }
@@ -372,4 +373,5 @@ $("login").addEventListener("click", async () => {
 if (token()) {
   refreshHeader();
   loadJobs();
+  loadOffers();
 }

@@ -2,7 +2,7 @@
 // API calls are never cached - the app.js queue handles offline deliveries.
 // Bump the version string whenever index.html / app.js change, so the
 // old cached copy is thrown away instead of being served forever.
-const CACHE = "driver-shell-v3";
+const CACHE = "driver-shell-v4";
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest",
                "./icon.svg"];
 

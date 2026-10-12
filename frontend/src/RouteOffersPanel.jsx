@@ -28,7 +28,7 @@ export default function RouteOffersPanel({ shipments, vehicles, drivers, locatio
       .then((res) => (res.ok ? res.json() : []))
       .then(setOffers)
       .catch(() => {});
-  useEffect(loadOffers, []);
+  useEffect(() => { loadOffers(); }, []);
 
   const chooseShipment = async (id) => {
     setShipmentId(id);
