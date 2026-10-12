@@ -188,6 +188,9 @@ def health():
         checks["database"] = f"error: {exc}"
         raise HTTPException(status_code=503, detail=checks)
     checks["delay_model"] = ("trained" if model_exists() else "untrained")
+    checks["driver_app_mounted"] = os.path.isdir(DRIVER_APP_DIR)
+    checks["driver_app_path"] = DRIVER_APP_DIR
+    checks["cwd"] = os.getcwd()
     checks["status"] = "ok"
     return checks
 
