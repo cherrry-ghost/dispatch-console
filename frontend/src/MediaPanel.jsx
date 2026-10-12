@@ -21,7 +21,7 @@ function MediaPanel() {
       .then(setChecks)
       .catch((err) => setError(err.message));
   };
-  useEffect(load, []);
+  useEffect(() => { load(); }, []);
 
   return (
     <div>
