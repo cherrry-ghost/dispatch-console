@@ -21,7 +21,7 @@ function refreshHeader() {
   $("who").innerHTML = token() && name ? `Signed in: <b>${name}</b>` : "";
   $("logout").style.display = token() ? "inline-block" : "none";
   $("loginBox").style.display = token() ? "none" : "";
-  $("licence").style.display = token() ? "" : "none";
+  $("profile").style.display = token() ? "" : "none";
 }
 function signOut() {
   localStorage.removeItem(TOKEN_KEY);
@@ -149,17 +149,22 @@ function render(data, driverId) {
   const done = data.completed || [];
   const pool = data.pending_pool ?? 0;
 
-  // licence status chip (green / amber / red)
-  const licEl = $("licence");
+  // profile card: who I am, licence status, hazmat
+  const profEl = $("profile");
   const lic = data.driver?.licence_expiry;
-  if (licEl && lic) {
-    const days = Math.floor((new Date(lic) - Date.now()) / 86400000);
-    const cls = days < 0 ? "lic-expired" : days < 60 ? "lic-soon" : "lic-ok";
-    const tail = days < 0 ? " — EXPIRED"
-      : days < 60 ? ` (${days} day${days === 1 ? "" : "s"} left)` : "";
-    licEl.innerHTML =
-      `Licence <b>${data.driver.licence_number || ""}</b> ` +
-      `<span class="lic ${cls}">valid till ${String(lic).slice(0, 10)}${tail}</span>`;
+  if (profEl && data.driver) {
+    const days = lic
+      ? Math.floor((new Date(lic) - Date.now()) / 86400000) : null;
+    const licChip = lic
+      ? `<span class="lic ${days < 0 ? "lic-expired" : days < 60 ? "lic-soon" : "lic-ok"}">` +
+        `valid till ${String(lic).slice(0, 10)}${days < 0 ? " — EXPIRED" : ""}</span>`
+      : `<span class="lic lic-expired">no licence on record</span>`;
+    profEl.innerHTML =
+      `<h3>${data.driver.full_name || "Driver"}` +
+      ` <span class="badge badge-muted">#${data.driver.id}</span></h3>` +
+      `<div class="row"><span>Licence No.</span><b>${data.driver.licence_number || "—"}</b></div>` +
+      `<div class="row"><span>Licence validity</span><b>${licChip}</b></div>` +
+      `<div class="row"><span>Hazmat certified</span><b>${data.driver.hazmat_certified ? "Yes" : "No"}</b></div>`;
   }
 
   let html = `<h2 class="sect">Active jobs (${jobs.length})</h2>`;

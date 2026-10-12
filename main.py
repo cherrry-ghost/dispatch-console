@@ -1365,8 +1365,8 @@ def driver_jobs(driver_id: int):
     the dispatch pool, and the driver's own licence status."""
     with get_connection() as conn:
         driver = conn.execute(
-            "SELECT id, full_name, licence_number, licence_expiry "
-            "FROM drivers WHERE id = %s", (driver_id,)
+            "SELECT id, full_name, licence_number, licence_expiry, "
+            "hazmat_certified FROM drivers WHERE id = %s", (driver_id,)
         ).fetchone()
         if driver is None:
             raise HTTPException(status_code=404, detail="Driver not found")
