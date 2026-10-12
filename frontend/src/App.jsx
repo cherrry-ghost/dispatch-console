@@ -17,6 +17,7 @@ import LoginBar from "./LoginBar";
 import LiveVehicles from "./LiveVehicles";
 import MediaPanel from "./MediaPanel";
 import NotificationsPanel from "./NotificationsPanel";
+import RouteOffersPanel from "./RouteOffersPanel";
 
 const API_URL = "http://localhost:8010";
 const NAMES = ["vehicles", "drivers", "locations", "shipments", "assignments", "zones"];
@@ -167,11 +168,16 @@ function App() {
                   const o = locById[s.origin_id];
                   const d = locById[s.destination_id];
                   if (!o || !d) return null;
+                  const completed = s.status === "completed";
                   return (
                     <Polyline
                       key={s.id}
                       positions={[[o.latitude, o.longitude], [d.latitude, d.longitude]]}
-                      pathOptions={{ color: STATUS_COLOR[s.status] || "#34d399" }}
+                      pathOptions={{
+                        color: STATUS_COLOR[s.status] || "#34d399",
+                        dashArray: completed ? "6 8" : undefined,
+                        opacity: completed ? 0.55 : 0.9,
+                      }}
                     >
                       <Tooltip sticky>
                         Shipment #{s.id}: {s.description} ({s.status})
@@ -209,7 +215,8 @@ function App() {
                 ))}
               </MapContainer>
               <p style={{ marginBottom: 0 }}>
-                Red dots = locations. Lines = shipments (grey pending, blue assigned, green other).
+                Red dots = locations. Lines = shipments: <span className="muted">grey pending</span>,
+                blue assigned, <span className="text-ok">green dashed completed</span>.
                 Shaded areas = zones: <span className="text-danger">red forbidden</span> (routing avoids, entry alerts),
                 <span className="text-warn"> amber alert</span> (warning only).
               </p>
@@ -341,6 +348,15 @@ function App() {
 
         {tab === "operations" && (
           <>
+            <div className="card">
+              <RouteOffersPanel
+                shipments={shipments}
+                vehicles={vehicles}
+                drivers={drivers}
+                locations={locations}
+                onDone={() => setVersion((v) => v + 1)}
+              />
+            </div>
             <div className="card">
               <AssignmentForm
                 shipments={shipments}
