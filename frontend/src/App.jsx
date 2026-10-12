@@ -153,8 +153,9 @@ function App() {
               ))}
             </div>
 
-            <div className="card">
-              <h2>Network map</h2>
+            <div className="overview-grid">
+              <div className="card">
+                <h2>Network map</h2>
               <MapContainer
                 center={[11.8, 78.5]}
                 zoom={7}
@@ -220,10 +221,20 @@ function App() {
                 Shaded areas = zones: <span className="text-danger">red forbidden</span> (routing avoids, entry alerts),
                 <span className="text-warn"> amber alert</span> (warning only).
               </p>
+              </div>
+              <div className="overview-side">
+                <div className="card">
+                  <EventsFeed />
+                </div>
+                <div className="card">
+                  <LiveVehicles />
+                </div>
+              </div>
             </div>
 
-            <div className="card">
-              <h2>Zones — what the shaded areas mean</h2>
+            <details className="card zones-details">
+              <summary>Zones — what the shaded areas mean (click to expand)</summary>
+              <div className="zones-body">
               <p style={{ marginTop: 0 }}>
                 A zone is an area we draw on the map (name, centre point, radius in km).
                 <b> Forbidden zones</b> are danger areas (war, conflict, disaster): before any
@@ -270,16 +281,8 @@ function App() {
                   </tbody>
                 </table>
               )}
-            </div>
-
-            <div className="grid two-col">
-              <div className="card" style={{ marginBottom: 0 }}>
-                <LiveVehicles />
               </div>
-              <div className="card" style={{ marginBottom: 0 }}>
-                <EventsFeed />
-              </div>
-            </div>
+            </details>
           </>
         )}
 
