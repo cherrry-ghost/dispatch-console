@@ -1864,6 +1864,225 @@ def request_route_use(body: RouteUseIn, response: Response,
             "label": label, "route": result}
 
 
+# ---- Phase 14: dispatcher proposes route options, the driver picks ----
+
+class RouteOfferIn(BaseModel):
+    shipment_id: int
+    vehicle_id: int
+    driver_id: int
+    option_indices: list[int] = Field(min_length=1, max_length=3)
+
+
+def _ranked_zone_routes(conn, from_id, to_id):
+    """Zone-aware ranked routes with risk labels: (routes, blocked_names)."""
+    edges = conn.execute("SELECT * FROM road_edges").fetchall()
+    locations = {r["id"]: r for r in conn.execute(
+        "SELECT id, latitude, longitude FROM locations").fetchall()}
+    zones = conn.execute(
+        "SELECT * FROM zones WHERE active AND zone_type = 'forbidden' "
+        "ORDER BY id").fetchall()
+    allowed_edges, blocked = split_edges_by_zones(edges, zones, locations)
+    routes = ranked_routes(allowed_edges, from_id, to_id)
+    for r in routes:
+        r["label"] = route_label(r["max_risk"])
+    return routes, sorted({z["name"] for _, z in blocked})
+
+
+@app.post("/route-offers")
+def create_route_offer(body: RouteOfferIn, response: Response,
+                       user: dict = Depends(require_roles("dispatcher"))):
+    """Send a pending shipment to one driver with 2-3 ranked route options.
+    The routes are recomputed server-side - the client only names indices."""
+    with get_connection() as conn:
+        shipment = conn.execute(
+            "SELECT * FROM shipments WHERE id = %s",
+            (body.shipment_id,)).fetchone()
+        if shipment is None:
+            raise HTTPException(status_code=404,
+                                detail="Shipment does not exist")
+        if shipment["status"] != "pending":
+            raise HTTPException(status_code=409,
+                                detail="Shipment is not pending any more")
+        routes, blocked_names = _ranked_zone_routes(
+            conn, shipment["origin_id"], shipment["destination_id"])
+        if not routes:
+            raise _no_route_error(blocked_names)
+        options = []
+        for i in body.option_indices:
+            if i < 0 or i >= len(routes):
+                raise HTTPException(status_code=400,
+                                    detail=f"Route option {i} does not exist")
+            options.append(routes[i])
+        offer = conn.execute(
+            "INSERT INTO route_offers (shipment_id, vehicle_id, driver_id, "
+            "options, offered_by) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (body.shipment_id, body.vehicle_id, body.driver_id,
+             Jsonb(options), user["username"])).fetchone()
+        append_audit(conn, "dispatcher", "route.offer", "allowed",
+                     entity_type="shipment", entity_id=str(body.shipment_id),
+                     details={"offer_id": offer["id"],
+                              "vehicle_id": body.vehicle_id,
+                              "driver_id": body.driver_id,
+                              "offered_options": [
+                                  {"label": o["label"],
+                                   "distance_km": o["distance_km"]}
+                                  for o in options]})
+    response.status_code = 201
+    return {"offer_id": offer["id"], "options": options,
+            "blocked_by_zones": blocked_names}
+
+
+@app.get("/route-offers")
+def list_route_offers(status: str | None = None):
+    """Console view of what was offered to whom, and what was claimed."""
+    query = ("SELECT o.id, o.shipment_id, o.vehicle_id, o.driver_id, "
+             "o.options, o.status, o.chosen_index, o.assignment_id, "
+             "o.offered_by, o.created_at, o.claimed_at, "
+             "s.description, d.full_name AS driver_name, v.plate "
+             "FROM route_offers o "
+             "JOIN shipments s ON s.id = o.shipment_id "
+             "JOIN drivers d ON d.id = o.driver_id "
+             "JOIN vehicles v ON v.id = o.vehicle_id")
+    params = ()
+    if status:
+        query += " WHERE o.status = %s"
+        params = (status,)
+    query += " ORDER BY o.id DESC LIMIT 25"
+    with get_connection() as conn:
+        return conn.execute(query, params).fetchall()
+
+
+@app.get("/driver/{driver_id}/offers")
+def driver_offers(driver_id: int):
+    """The driver app: open route offers waiting for this driver's pick."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT o.id, o.shipment_id, o.vehicle_id, o.options, o.status, "
+            "o.chosen_index, o.created_at, "
+            "s.description, s.weight_kg, "
+            "org.name AS origin_name, dst.name AS destination_name, "
+            "v.plate, v.vehicle_type "
+            "FROM route_offers o "
+            "JOIN shipments s ON s.id = o.shipment_id "
+            "JOIN locations org ON org.id = s.origin_id "
+            "JOIN locations dst ON dst.id = s.destination_id "
+            "JOIN vehicles v ON v.id = o.vehicle_id "
+            "WHERE o.driver_id = %s AND o.status = 'offered' "
+            "ORDER BY o.id DESC", (driver_id,)).fetchall()
+
+
+class RouteClaimIn(BaseModel):
+    option_index: int
+
+
+@app.post("/driver/{driver_id}/offers/{offer_id}/claim")
+async def claim_route_offer(driver_id: int, offer_id: int,
+                            body: RouteClaimIn,
+                            user: dict = Depends(require_driver)):
+    """The driver picks one offered route. The SAME guardrails as a normal
+    assignment run here; a risky route parks the job for manager approval."""
+    with get_connection() as conn:
+        offer = conn.execute(
+            "SELECT * FROM route_offers WHERE id = %s", (offer_id,)).fetchone()
+        if offer is None or offer["driver_id"] != driver_id:
+            raise HTTPException(status_code=404, detail="Offer not found")
+        if offer["status"] != "offered":
+            raise HTTPException(status_code=409,
+                                detail="This offer was already answered")
+        options = offer["options"]
+        if body.option_index < 0 or body.option_index >= len(options):
+            raise HTTPException(status_code=400,
+                                detail="Route option does not exist")
+        chosen = options[body.option_index]
+        req = {"shipment_id": offer["shipment_id"],
+               "vehicle_id": offer["vehicle_id"],
+               "driver_id": driver_id,
+               "reason": (f"Driver chose '{chosen['label']}' route "
+                          f"({chosen['distance_km']} km) from offer #{offer_id}")}
+        vehicle, driver, shipment = load_entities(conn, req)
+    if vehicle is None or driver is None or shipment is None:
+        raise HTTPException(status_code=400,
+                            detail="Shipment, vehicle or driver no longer exists")
+
+    results = evaluate(vehicle, driver, shipment, date.today())
+    warnings = [asdict(r) for r in results]
+    audit_details = {"offer_id": offer_id,
+                     "option_index": body.option_index,
+                     "route_label": chosen["label"], "request": req,
+                     "guardrail_results": warnings}
+    events_to_broadcast = []
+    if not is_allowed(results):
+        with get_connection() as conn:
+            append_audit(conn, "driver", "route.claim", "blocked",
+                         actor_id=str(driver_id), entity_type="shipment",
+                         entity_id=str(offer["shipment_id"]),
+                         details=audit_details)
+        raise HTTPException(status_code=422, detail={
+            "message": "Assignment blocked by guardrails",
+            "violations": warnings})
+    try:
+        with get_connection() as conn:
+            risky = chosen["label"] == "needs_approval"
+            if warnings or risky:
+                approval = conn.execute(
+                    "INSERT INTO approvals (action, entity_type, entity_id, "
+                    "request, warnings, requested_by) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    ("assignment.create", "shipment",
+                     str(offer["shipment_id"]),
+                     Jsonb({**req, "route_option": chosen}),
+                     Jsonb(warnings), f"driver:{driver_id}")).fetchone()
+                append_audit(conn, "driver", "route.claim", "pending",
+                             actor_id=str(driver_id), entity_type="shipment",
+                             entity_id=str(offer["shipment_id"]),
+                             details={**audit_details,
+                                      "approval_id": approval["id"]})
+                conn.execute(
+                    "UPDATE route_offers SET status = 'claimed', "
+                    "chosen_index = %s, claimed_at = now() WHERE id = %s",
+                    (body.option_index, offer_id))
+                out = {"status": "pending_approval",
+                       "approval_id": approval["id"],
+                       "message": ("Manager approval needed for the risky "
+                                   "route. The office will confirm.")}
+            else:
+                row = apply_assignment(conn, req)
+                append_audit(conn, "driver", "route.claim", "allowed",
+                             actor_id=str(driver_id), entity_type="shipment",
+                             entity_id=str(offer["shipment_id"]),
+                             details=audit_details)
+                conn.execute(
+                    "UPDATE route_offers SET status = 'claimed', "
+                    "chosen_index = %s, assignment_id = %s, claimed_at = now() "
+                    "WHERE id = %s", (body.option_index, row["id"], offer_id))
+                created = emit(conn, "assignment.created", "info",
+                               vehicle_id=req["vehicle_id"],
+                               shipment_id=req["shipment_id"],
+                               details={"driver_id": driver_id})
+                events_to_broadcast.append(created)
+                shipment_row = conn.execute(
+                    "SELECT id FROM shipments WHERE id = %s",
+                    (req["shipment_id"],)).fetchone()
+                vehicle_row = conn.execute(
+                    "SELECT plate FROM vehicles WHERE id = %s",
+                    (req["vehicle_id"],)).fetchone()
+                note_event = notify(conn, req["shipment_id"], "assigned",
+                                    assigned_message(shipment_row,
+                                                     vehicle_row["plate"]))
+                events_to_broadcast.append(note_event)
+                out = {**row, **req, "warnings": [],
+                       "message": "Job assigned - it is now in Active jobs."}
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(status_code=409,
+                            detail="This shipment already has an active assignment")
+    except psycopg.errors.ForeignKeyViolation:
+        raise HTTPException(status_code=400,
+                            detail="Shipment, vehicle or driver no longer exists")
+    for ev in events_to_broadcast:
+        await broadcast_event(ev)
+    return out
+
+
 class ScenarioZoneIn(BaseModel):
     name: str
     center_lat: float = Field(ge=-90, le=90)

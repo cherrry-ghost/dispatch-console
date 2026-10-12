@@ -277,9 +277,74 @@ function render(data, driverId) {
   });
 }
 
+// ---- route offers: the office proposed routes, the driver picks ----
+async function loadOffers() {
+  if (!token()) { $("offers").innerHTML = ""; return; }
+  const driverId = Number($("driverId").value || 1);
+  try {
+    const res = await fetch(`/driver/${driverId}/offers`);
+    const offers = res.ok ? await res.json() : [];
+    renderOffers(offers, driverId);
+  } catch {
+    $("offers").innerHTML = "";
+  }
+}
+
+function renderOffers(offers, driverId) {
+  if (!offers.length) {
+    $("offers").innerHTML =
+      `<p class="meta">No route offers waiting. The office sends offers — ` +
+      `you pick the route you prefer.</p>`;
+    return;
+  }
+  $("offers").innerHTML = offers.map((o) => `
+    <div class="offer" data-offer="${o.id}">
+      <h3>Route offer — Shipment #${o.shipment_id}</h3>
+      <div class="sub">${o.description || "(no description)"} · ${o.weight_kg} kg ·
+        from <b>${o.origin_name}</b> to <b>${o.destination_name}</b> ·
+        vehicle ${o.plate}</div>
+      <p class="meta" style="margin: 0 0 8px">Pick the route you will drive:</p>
+      ${(o.options || []).map((opt, i) => `
+        <button class="opt" data-claim="${i}">
+          <span>Route ${String.fromCharCode(65 + i)} ·
+            <span class="lbl lbl-${opt.label}">${opt.label.replace("_", " ")}</span>
+            · ${opt.distance_km} km</span>
+          <span>Take →</span>
+        </button>`).join("")}
+      <p class="note msg-here"></p>
+    </div>`).join("");
+
+  $("offers").querySelectorAll("[data-claim]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const box = btn.closest(".offer");
+      const offerId = box.dataset.offer;
+      const index = Number(btn.dataset.claim);
+      btn.disabled = true;
+      btn.textContent = "Booking…";
+      try {
+        const res = await fetch(
+          `/driver/${driverId}/offers/${offerId}/claim`,
+          { method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ option_index: index }) });
+        if (res.status === 401) { sessionExpired(); return; }
+        const body = await res.json();
+        box.querySelector(".msg-here").textContent =
+          res.ok ? ("✔ " + body.message) : (body.detail?.message || "Could not book");
+        loadJobs();
+        loadOffers();
+      } catch (err) {
+        btn.disabled = false;
+        box.querySelector(".msg-here").textContent = "Network error: " + err.message;
+      }
+    });
+  });
+}
+
 const loadBtn = $("load");
 if (loadBtn) loadBtn.addEventListener("click", loadJobs);
 loadJobs();
+loadOffers();
 
 
 // ---- sign in with driver id + PIN -------------------------------

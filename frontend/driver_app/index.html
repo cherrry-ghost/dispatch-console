@@ -117,6 +117,26 @@
       font-size: 13.5px; color: var(--muted);
     }
     .done-row .when { color: var(--faint); font-size: 12px; display: block; }
+    .offer {
+      background: linear-gradient(180deg, #12203a, #0e1830);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 10px; padding: 14px; margin-bottom: 14px;
+    }
+    .offer h3 { margin: 0 0 4px; font-size: 15px; color: var(--accent); }
+    .offer .sub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+    .offer .opt {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 10px; background: var(--bg-deep); border: 1px solid var(--border);
+      border-radius: 8px; padding: 9px 12px; margin-bottom: 8px;
+      font-size: 13.5px; color: var(--muted); cursor: pointer; width: 100%;
+      text-align: left;
+    }
+    .offer .opt:hover { border-color: var(--accent); }
+    .offer .lbl { font-weight: 700; }
+    .lbl-safe { color: var(--ok); }
+    .lbl-caution { color: var(--warn); }
+    .lbl-needs_approval { color: var(--danger); }
+    .offer .note { color: var(--ok); font-size: 13px; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -131,6 +151,7 @@
   <div id="queue"></div>
   <main>
     <div id="profile" class="card profile"></div>
+    <div id="offers"></div>
     <div class="card signin" id="loginBox">
       <label>Driver ID: <input id="driverId" type="number" value="1" /></label>
       <label>PIN: <input id="pin" type="password" value="" size="6"
