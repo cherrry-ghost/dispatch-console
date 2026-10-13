@@ -59,9 +59,24 @@ app.add_middleware(
 )
 
 # The driver PWA is plain files (no build step) served by the API itself,
-# so a phone only needs the backend to install and use it.
+# so a phone only needs the backend to install and use it. Cloud hosts do
+# not always copy frontend/ into the runtime image, so the files are also
+# packed into driver_app_payload.py and unpacked to a temp dir as fallback.
 DRIVER_APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "frontend", "driver_app")
+if not os.path.isdir(DRIVER_APP_DIR):
+    import base64
+    import tempfile
+    try:
+        import driver_app_payload
+        DRIVER_APP_DIR = os.path.join(tempfile.gettempdir(),
+                                      "dispatch_driver_app")
+        os.makedirs(DRIVER_APP_DIR, exist_ok=True)
+        for _name, _b64 in driver_app_payload.FILES.items():
+            with open(os.path.join(DRIVER_APP_DIR, _name), "wb") as _fh:
+                _fh.write(base64.b64decode(_b64))
+    except Exception:  # leave DRIVER_APP_DIR as-is if unpacking fails
+        pass
 if os.path.isdir(DRIVER_APP_DIR):
     app.mount("/driver-app", StaticFiles(directory=DRIVER_APP_DIR, html=True),
               name="driver-app")
